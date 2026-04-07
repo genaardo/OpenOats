@@ -78,13 +78,17 @@ final class LiveSessionController {
 
     // MARK: - Polling Loop
 
-    /// Call from a `.task` modifier to start the 250ms polling loop.
+    /// Call from a `.task` modifier to start the polling loop.
+    /// Polls at 250ms while recording for responsive UI, and at 2s while idle
+    /// to minimize observation churn and SwiftUI re-render cycles.
     func runPollingLoop(settings: AppSettings) async {
         refreshState(settings: settings)
         synchronizeDerivedState(settings: settings)
 
         while !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(250))
+            let isActive = coordinator.transcriptionEngine?.isRunning == true
+                || coordinator.batchStatus != .idle
+            try? await Task.sleep(for: isActive ? .milliseconds(250) : .seconds(2))
 
             // Poll batch engine status (actor-isolated)
             if let engine = coordinator.batchAudioTranscriber {
@@ -496,6 +500,13 @@ final class LiveSessionController {
 
     // MARK: - State Refresh
 
+    /// Assigns `value` to `state[keyPath:]` only when it differs, avoiding spurious
+    /// @Observable withMutation notifications that would trigger unnecessary layout passes.
+    @inline(__always)
+    private func set<T: Equatable>(_ kp: ReferenceWritableKeyPath<LiveSessionState, T>, _ value: T) {
+        if state[keyPath: kp] != value { state[keyPath: kp] = value }
+    }
+
     @MainActor
     private func refreshState(settings: AppSettings) {
         let lastEndedSession = coordinator.lastEndedSession
@@ -523,33 +534,35 @@ final class LiveSessionController {
 
         let isRunning = coordinator.transcriptionEngine?.isRunning ?? false
 
-        // Scalar fields: assign directly. Since LiveSessionState is @Observable, SwiftUI
-        // tracks each property individually, and AttributeGraph suppresses re-renders when
-        // the value hasn't actually changed — no manual equality guards needed.
-        state.isRunning = isRunning
-        state.sessionPhase = coordinator.state
-        state.audioLevel = isRunning ? (coordinator.transcriptionEngine?.audioLevel ?? 0) : 0
-        state.volatileYouText = coordinator.transcriptStore.volatileYouText
-        state.volatileThemText = coordinator.transcriptStore.volatileThemText
-        state.isGeneratingSuggestions = sidebarGenerating
-        state.batchStatus = coordinator.batchStatus
-        state.batchIsImporting = coordinator.batchIsImporting
-        state.lastEndedSession = lastEndedSession
-        state.lastSessionHasNotes = lastSessionHasNotes
-        state.kbIndexingProgress = coordinator.knowledgeBase?.indexingProgress ?? ""
-        state.statusMessage = coordinator.transcriptionEngine?.assetStatus
-        state.errorMessage = coordinator.transcriptionEngine?.lastError
-        state.needsDownload = coordinator.transcriptionEngine?.needsModelDownload ?? false
-        state.downloadProgress = coordinator.transcriptionEngine?.downloadProgress
-        state.downloadDetail = coordinator.transcriptionEngine?.downloadDetail
-        state.transcriptionPrompt = settings.transcriptionModel.downloadPrompt
-        state.modelDisplayName = activeModelRaw.split(separator: "/").last.map(String.init) ?? activeModelRaw
-        state.showLiveTranscript = settings.showLiveTranscript
-        state.isMicMuted = coordinator.transcriptionEngine?.isMicMuted ?? false
+        // Use set(_:_:) for all Equatable fields: only fires @Observable withMutation
+        // when the value actually changed, preventing spurious layout passes on NSHostingView.
+        set(\.isRunning, isRunning)
+        set(\.sessionPhase, coordinator.state)
+        set(\.audioLevel, isRunning ? (coordinator.transcriptionEngine?.audioLevel ?? 0) : 0)
+        set(\.volatileYouText, coordinator.transcriptStore.volatileYouText)
+        set(\.volatileThemText, coordinator.transcriptStore.volatileThemText)
+        set(\.isGeneratingSuggestions, sidebarGenerating)
+        set(\.batchStatus, coordinator.batchStatus)
+        set(\.batchIsImporting, coordinator.batchIsImporting)
+        if state.lastEndedSession?.id != lastEndedSession?.id { state.lastEndedSession = lastEndedSession }
+        set(\.lastSessionHasNotes, lastSessionHasNotes)
+        set(\.kbIndexingProgress, coordinator.knowledgeBase?.indexingProgress ?? "")
+        set(\.statusMessage, coordinator.transcriptionEngine?.assetStatus)
+        set(\.errorMessage, coordinator.transcriptionEngine?.lastError)
+        set(\.needsDownload, coordinator.transcriptionEngine?.needsModelDownload ?? false)
+        set(\.downloadProgress, coordinator.transcriptionEngine?.downloadProgress)
+        set(\.transcriptionPrompt, settings.transcriptionModel.downloadPrompt)
+        set(\.modelDisplayName, activeModelRaw.split(separator: "/").last.map(String.init) ?? activeModelRaw)
+        set(\.showLiveTranscript, settings.showLiveTranscript)
+        set(\.isMicMuted, coordinator.transcriptionEngine?.isMicMuted ?? false)
         // scratchpadText is managed by updateScratchpad(), not refreshed from coordinator
+        // downloadDetail is not Equatable; only update when nil-ness changes or download active
+        let nextDetail = coordinator.transcriptionEngine?.downloadDetail
+        if nextDetail != nil || state.downloadDetail != nil {
+            state.downloadDetail = nextDetail
+        }
 
-        // Arrays: guard assignment since assigning an array always fires observation
-        // regardless of content, and the downstream view work is proportional to array size.
+        // Arrays: compare by ID before assigning — array assignment always fires observation.
         let nextTranscript = coordinator.transcriptStore.utterances
         if state.liveTranscript.map(\.id) != nextTranscript.map(\.id) {
             state.liveTranscript = nextTranscript
