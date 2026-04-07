@@ -4,7 +4,10 @@ import CoreAudio
 import AppKit
 
 /// Published state for the live session, projected by ContentView.
-struct LiveSessionState {
+/// Declared as @Observable class so SwiftUI tracks each property individually,
+/// preventing a full view-tree re-render whenever any single field changes.
+@Observable
+final class LiveSessionState {
     var isRunning: Bool = false
     var sessionPhase: MeetingState = .idle
     var audioLevel: Float = 0
@@ -507,7 +510,6 @@ final class LiveSessionController {
         case .openAICompatible: settings.openAILLMModel
         }
 
-        var next = LiveSessionState()
         let sidebarSuggestions: [Suggestion]
         let sidebarGenerating: Bool
         switch settings.sidebarMode {
@@ -518,31 +520,43 @@ final class LiveSessionController {
             sidebarSuggestions = coordinator.sidecastEngine?.suggestions ?? []
             sidebarGenerating = coordinator.sidecastEngine?.isGenerating ?? false
         }
-        next.isRunning = coordinator.transcriptionEngine?.isRunning ?? false
-        next.sessionPhase = coordinator.state
-        next.audioLevel = next.isRunning ? (coordinator.transcriptionEngine?.audioLevel ?? 0) : 0
-        next.liveTranscript = coordinator.transcriptStore.utterances
-        next.volatileYouText = coordinator.transcriptStore.volatileYouText
-        next.volatileThemText = coordinator.transcriptStore.volatileThemText
-        next.suggestions = sidebarSuggestions
-        next.isGeneratingSuggestions = sidebarGenerating
-        next.batchStatus = coordinator.batchStatus
-        next.batchIsImporting = coordinator.batchIsImporting
-        next.lastEndedSession = lastEndedSession
-        next.lastSessionHasNotes = lastSessionHasNotes
-        next.kbIndexingProgress = coordinator.knowledgeBase?.indexingProgress ?? ""
-        next.statusMessage = coordinator.transcriptionEngine?.assetStatus
-        next.errorMessage = coordinator.transcriptionEngine?.lastError
-        next.needsDownload = coordinator.transcriptionEngine?.needsModelDownload ?? false
-        next.downloadProgress = coordinator.transcriptionEngine?.downloadProgress
-        next.downloadDetail = coordinator.transcriptionEngine?.downloadDetail
-        next.transcriptionPrompt = settings.transcriptionModel.downloadPrompt
-        next.modelDisplayName = activeModelRaw.split(separator: "/").last.map(String.init) ?? activeModelRaw
-        next.showLiveTranscript = settings.showLiveTranscript
-        next.isMicMuted = coordinator.transcriptionEngine?.isMicMuted ?? false
-        next.scratchpadText = state.scratchpadText
 
-        state = next
+        let isRunning = coordinator.transcriptionEngine?.isRunning ?? false
+
+        // Scalar fields: assign directly. Since LiveSessionState is @Observable, SwiftUI
+        // tracks each property individually, and AttributeGraph suppresses re-renders when
+        // the value hasn't actually changed — no manual equality guards needed.
+        state.isRunning = isRunning
+        state.sessionPhase = coordinator.state
+        state.audioLevel = isRunning ? (coordinator.transcriptionEngine?.audioLevel ?? 0) : 0
+        state.volatileYouText = coordinator.transcriptStore.volatileYouText
+        state.volatileThemText = coordinator.transcriptStore.volatileThemText
+        state.isGeneratingSuggestions = sidebarGenerating
+        state.batchStatus = coordinator.batchStatus
+        state.batchIsImporting = coordinator.batchIsImporting
+        state.lastEndedSession = lastEndedSession
+        state.lastSessionHasNotes = lastSessionHasNotes
+        state.kbIndexingProgress = coordinator.knowledgeBase?.indexingProgress ?? ""
+        state.statusMessage = coordinator.transcriptionEngine?.assetStatus
+        state.errorMessage = coordinator.transcriptionEngine?.lastError
+        state.needsDownload = coordinator.transcriptionEngine?.needsModelDownload ?? false
+        state.downloadProgress = coordinator.transcriptionEngine?.downloadProgress
+        state.downloadDetail = coordinator.transcriptionEngine?.downloadDetail
+        state.transcriptionPrompt = settings.transcriptionModel.downloadPrompt
+        state.modelDisplayName = activeModelRaw.split(separator: "/").last.map(String.init) ?? activeModelRaw
+        state.showLiveTranscript = settings.showLiveTranscript
+        state.isMicMuted = coordinator.transcriptionEngine?.isMicMuted ?? false
+        // scratchpadText is managed by updateScratchpad(), not refreshed from coordinator
+
+        // Arrays: guard assignment since assigning an array always fires observation
+        // regardless of content, and the downstream view work is proportional to array size.
+        let nextTranscript = coordinator.transcriptStore.utterances
+        if state.liveTranscript.map(\.id) != nextTranscript.map(\.id) {
+            state.liveTranscript = nextTranscript
+        }
+        if state.suggestions.map(\.id) != sidebarSuggestions.map(\.id) {
+            state.suggestions = sidebarSuggestions
+        }
     }
 
     // MARK: - Derived State Synchronization
