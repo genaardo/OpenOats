@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import CryptoKit
 
@@ -68,6 +69,10 @@ final class KnowledgeBase {
         get { access(keyPath: \.indexingProgress); return _indexingProgress }
         set { withMutation(keyPath: \.indexingProgress) { _indexingProgress = newValue } }
     }
+
+    /// Unit-normalized embeddings parallel to `chunks`, pre-computed at index time.
+    /// Cosine similarity on normalized vectors reduces to a single dot product.
+    private var normalizedChunkEmbeddings: [[Float]] = []
 
     private let settings: AppSettings
     private let voyageClient = VoyageClient()
@@ -175,6 +180,7 @@ final class KnowledgeBase {
             }
         }
 
+        self.normalizedChunkEmbeddings = allChunks.map { Self.normalizeEmbedding($0.embedding) }
         self.chunks = allChunks
         self.fileCount = scanResult.fileCount
         self.isIndexed = true
@@ -268,11 +274,14 @@ final class KnowledgeBase {
             return []
         }
 
-        // Score fusion: for each chunk, take max cosine similarity across all queries
+        // Score fusion: for each chunk, take max cosine similarity across all queries.
+        // Query is normalized once per query; chunk embeddings are pre-normalized at index time,
+        // so cosine similarity reduces to a single vDSP dot product.
         var bestScores: [Int: Float] = [:]
         for queryEmb in queryEmbeddings {
-            for (i, chunk) in chunks.enumerated() {
-                let sim = cosineSimilarity(queryEmb, chunk.embedding)
+            let normQuery = Self.normalizeEmbedding(queryEmb)
+            for i in 0..<chunks.count {
+                let sim = cosineSimilarity(normQuery, normalizedChunkEmbeddings[i])
                 if sim > 0.1 {
                     bestScores[i] = max(bestScores[i] ?? 0, sim)
                 }
@@ -356,6 +365,7 @@ final class KnowledgeBase {
 
     func clear() {
         chunks.removeAll()
+        normalizedChunkEmbeddings.removeAll()
         isIndexed = false
         fileCount = 0
         indexingProgress = ""
@@ -597,22 +607,27 @@ final class KnowledgeBase {
 
     // MARK: - Vector Math
 
+    /// Returns the dot product of two pre-normalized (unit) vectors, which equals cosine similarity.
+    /// Both inputs must already be unit vectors — call `normalizeEmbedding` first.
     private nonisolated func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
+        var result: Float = 0
+        vDSP_dotpr(a, 1, b, 1, &result, vDSP_Length(a.count))
+        return result
+    }
 
-        var dot: Float = 0
-        var magA: Float = 0
-        var magB: Float = 0
-
-        for i in 0..<a.count {
-            dot += a[i] * b[i]
-            magA += a[i] * a[i]
-            magB += b[i] * b[i]
-        }
-
-        let denom = sqrt(magA) * sqrt(magB)
-        guard denom > 0 else { return 0 }
-        return dot / denom
+    /// Returns a unit-length copy of `v` using SIMD-accelerated vDSP operations.
+    /// Pre-normalizing embeddings at index time means each search query pays only a dot product.
+    private nonisolated static func normalizeEmbedding(_ v: [Float]) -> [Float] {
+        guard !v.isEmpty else { return v }
+        var sumOfSquares: Float = 0
+        vDSP_svesq(v, 1, &sumOfSquares, vDSP_Length(v.count))
+        let mag = sqrt(sumOfSquares)
+        guard mag > 0 else { return v }
+        var scale = 1.0 / mag
+        var result = [Float](repeating: 0, count: v.count)
+        vDSP_vsmul(v, 1, &scale, &result, 1, vDSP_Length(v.count))
+        return result
     }
 
     // MARK: - Cache
