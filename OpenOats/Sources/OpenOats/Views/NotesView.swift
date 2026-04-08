@@ -742,17 +742,25 @@ struct NotesView: View {
                     .font(.system(size: 12))
             }
 
-            Button {
-                controller.generateNotes(sessionID: sessionID, settings: settings)
-            } label: {
-                Label("Generate Notes", systemImage: "sparkles")
+            VStack(spacing: 8) {
+                Button {
+                    controller.generateNotes(sessionID: sessionID, settings: settings)
+                } label: {
+                    Label("Generate Notes", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(state.loadedTranscript.isEmpty || controller.isAnyGenerationInProgress)
+                .accessibilityIdentifier("notes.generateButton")
+
+                if controller.isAnyGenerationInProgress {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini)
+                        Text("Generating notes for \"\(controller.generatingSessionName)\"...")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(state.loadedTranscript.isEmpty || controller.isAnyGenerationInProgress)
-            .help(controller.isAnyGenerationInProgress
-                ? "Generating notes for \"\(controller.generatingSessionName)\"..."
-                : "")
-            .accessibilityIdentifier("notes.generateButton")
         }
     }
 
