@@ -24,6 +24,9 @@ struct NotesState {
     var audioFileURL: URL?
     /// Whether audio is currently playing.
     var isPlayingAudio: Bool = false
+    /// Sessions whose notes were freshly generated while the user was on a different session.
+    /// Cleared when the user opens that session. Used to show the blue "unread" indicator.
+    var freshlyGeneratedSessionIDs: Set<String> = []
 }
 
 enum CleanupStatus: Equatable {
@@ -126,6 +129,7 @@ final class NotesController {
         state.selectedSessionDirectory = coordinator.sessionRepository.sessionsDirectoryURL
             .appendingPathComponent(sessionID, isDirectory: true)
         state.showingOriginal = false
+        state.freshlyGeneratedSessionIDs.remove(sessionID)
         coordinator.batchTextCleaner.cancel()
         syncCleanupStatus()
 
@@ -256,10 +260,15 @@ final class NotesController {
             await coordinator.sessionRepository.saveNotes(sessionID: sessionID, notes: notes)
             await loadHistory()
 
-            // Only update visible UI state if the user is still on this session
-            guard state.selectedSessionID == sessionID else { return }
-            state.loadedNotes = notes
-            state.notesGenerationStatus = .completed
+            if state.selectedSessionID == sessionID {
+                // User is still on this session — update UI directly
+                state.loadedNotes = notes
+                state.notesGenerationStatus = .completed
+            } else {
+                // User has moved away — show the blue "unread" badge in the sidebar
+                state.freshlyGeneratedSessionIDs.insert(sessionID)
+            }
+            return
         } else if state.selectedSessionID == sessionID {
             if let error = coordinator.notesEngine.error {
                 state.notesGenerationStatus = .error(error)
@@ -420,6 +429,18 @@ final class NotesController {
     /// Notes engine error for display (when not yet mapped to status).
     var notesEngineError: String? {
         coordinator.notesEngine.error
+    }
+
+    /// True whenever any session's notes are being generated.
+    var isAnyGenerationInProgress: Bool {
+        generatingSessionID != nil
+    }
+
+    /// Display name of the session currently being generated (for tooltip messaging).
+    var generatingSessionName: String {
+        guard let id = generatingSessionID else { return "" }
+        let title = state.sessionHistory.first { $0.id == id }?.title ?? ""
+        return title.isEmpty ? "Untitled" : title
     }
 
     // MARK: - Private

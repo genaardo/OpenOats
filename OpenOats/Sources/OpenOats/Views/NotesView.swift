@@ -209,7 +209,11 @@ struct NotesView: View {
                 if session.hasNotes {
                     Image(systemName: "doc.text.fill")
                         .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(
+                            controller.state.freshlyGeneratedSessionIDs.contains(session.id)
+                                ? Color.accentColor
+                                : Color.secondary
+                        )
                 }
             }
 
@@ -582,7 +586,10 @@ struct NotesView: View {
             .menuStyle(.button)
             .buttonStyle(.bordered)
             .fixedSize()
-            .help("Click to regenerate, or pick a different template")
+            .disabled(controller.isAnyGenerationInProgress)
+            .help(controller.isAnyGenerationInProgress
+                ? "Generating notes for \"\(controller.generatingSessionName)\"..."
+                : "Click to regenerate, or pick a different template")
         }
 
         imageInsertMenu(controller: controller, state: state)
@@ -741,7 +748,10 @@ struct NotesView: View {
                 Label("Generate Notes", systemImage: "sparkles")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(state.loadedTranscript.isEmpty)
+            .disabled(state.loadedTranscript.isEmpty || controller.isAnyGenerationInProgress)
+            .help(controller.isAnyGenerationInProgress
+                ? "Generating notes for \"\(controller.generatingSessionName)\"..."
+                : "")
             .accessibilityIdentifier("notes.generateButton")
         }
     }
