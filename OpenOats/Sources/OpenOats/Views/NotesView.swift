@@ -22,7 +22,12 @@ struct NotesView: View {
         case notes = "Notes"
     }
 
+    enum AppleNotesSyncState {
+        case idle, syncing, success, failed
+    }
+
     @State private var detailViewMode: DetailViewMode = .transcript
+    @State private var appleNotesSyncState: AppleNotesSyncState = .idle
 
     var body: some View {
         Group {
@@ -71,6 +76,9 @@ struct NotesView: View {
             if controller.handleRequestedSessionSelection() {
                 detailViewMode = .notes
             }
+        }
+        .onChange(of: controller.state.selectedSessionID) {
+            appleNotesSyncState = .idle
         }
     }
 
@@ -595,6 +603,54 @@ struct NotesView: View {
         }
 
         imageInsertMenu(controller: controller, state: state)
+
+        if settings.appleNotesEnabled, state.loadedNotes != nil {
+            appleNotesSyncButton(controller: controller, state: state)
+        }
+    }
+
+    @ViewBuilder
+    private func appleNotesSyncButton(controller: NotesController, state: NotesState) -> some View {
+        Button {
+            guard appleNotesSyncState != .syncing else { return }
+            guard let sessionID = state.selectedSessionID,
+                  let sessionIndex = state.sessionHistory.first(where: { $0.id == sessionID })
+            else { return }
+
+            appleNotesSyncState = .syncing
+            Task {
+                let success = await AppleNotesService.sync(
+                    settings: settings,
+                    sessionIndex: sessionIndex,
+                    records: state.loadedTranscript,
+                    notesMarkdown: state.loadedNotes?.markdown
+                )
+                appleNotesSyncState = success ? .success : .failed
+                if success {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if appleNotesSyncState == .success { appleNotesSyncState = .idle }
+                }
+            }
+        } label: {
+            switch appleNotesSyncState {
+            case .idle:
+                Label("Sync to Apple Notes", systemImage: "note.text")
+                    .font(.system(size: 12))
+            case .syncing:
+                Label("Syncing…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 12))
+            case .success:
+                Label("Synced", systemImage: "checkmark")
+                    .font(.system(size: 12))
+            case .failed:
+                Label("Sync Failed", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 12))
+            }
+        }
+        .buttonStyle(.bordered)
+        .tint(appleNotesSyncState == .success ? .green : appleNotesSyncState == .failed ? .red : nil)
+        .disabled(appleNotesSyncState == .syncing)
+        .help("Export current notes to Apple Notes")
     }
 
     @ViewBuilder
