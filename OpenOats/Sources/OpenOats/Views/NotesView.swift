@@ -28,6 +28,7 @@ struct NotesView: View {
 
     @State private var detailViewMode: DetailViewMode = .transcript
     @State private var appleNotesSyncState: AppleNotesSyncState = .idle
+    @State private var appleNotesLastSyncDate: Date? = nil
 
     var body: some View {
         Group {
@@ -79,6 +80,8 @@ struct NotesView: View {
         }
         .onChange(of: controller.state.selectedSessionID) {
             appleNotesSyncState = .idle
+            appleNotesLastSyncDate = controller.state.selectedSessionID
+                .flatMap { AppleNotesService.lastSyncDate(for: $0) }
         }
     }
 
@@ -627,6 +630,7 @@ struct NotesView: View {
                 )
                 appleNotesSyncState = success ? .success : .failed
                 if success {
+                    appleNotesLastSyncDate = Date()
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     if appleNotesSyncState == .success { appleNotesSyncState = .idle }
                 }
@@ -634,7 +638,8 @@ struct NotesView: View {
         } label: {
             switch appleNotesSyncState {
             case .idle:
-                Label("Sync to Apple Notes", systemImage: "note.text")
+                let label = appleNotesLastSyncDate != nil ? "Re-sync to Apple Notes" : "Sync to Apple Notes"
+                Label(label, systemImage: "note.text")
                     .font(.system(size: 12))
             case .syncing:
                 Label("Syncing…", systemImage: "arrow.triangle.2.circlepath")
@@ -650,7 +655,14 @@ struct NotesView: View {
         .buttonStyle(.bordered)
         .tint(appleNotesSyncState == .success ? .green : appleNotesSyncState == .failed ? .red : nil)
         .disabled(appleNotesSyncState == .syncing)
-        .help("Export current notes to Apple Notes")
+        .help(appleNotesLastSyncDate.map { "Last synced \($0.formatted(.relative(presentation: .named))). Syncing again will overwrite the note." }
+              ?? "Export current notes to Apple Notes")
+
+        if appleNotesSyncState == .idle, let lastSync = appleNotesLastSyncDate {
+            Text("Synced \(lastSync.formatted(.relative(presentation: .named)))")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder
