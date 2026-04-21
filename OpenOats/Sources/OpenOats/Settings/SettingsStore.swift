@@ -793,6 +793,17 @@ final class SettingsStore {
         }
     }
 
+    @ObservationIgnored nonisolated(unsafe) private var _appleNotesAutoExport: Bool
+    var appleNotesAutoExport: Bool {
+        get { access(keyPath: \.appleNotesAutoExport); return _appleNotesAutoExport }
+        set {
+            withMutation(keyPath: \.appleNotesAutoExport) {
+                _appleNotesAutoExport = newValue
+                defaults.set(newValue, forKey: "appleNotesAutoExport")
+            }
+        }
+    }
+
     // MARK: - Webhook Settings
 
     @ObservationIgnored nonisolated(unsafe) private var _webhookEnabled: Bool
@@ -1212,6 +1223,11 @@ final class SettingsStore {
         }
         self._appleNotesFolderName = defaults.string(forKey: "appleNotesFolderName") ?? "OpenOats"
         self._appleNotesAccountName = defaults.string(forKey: "appleNotesAccountName") ?? "iCloud"
+        if defaults.object(forKey: "appleNotesAutoExport") == nil {
+            self._appleNotesAutoExport = true
+        } else {
+            self._appleNotesAutoExport = defaults.bool(forKey: "appleNotesAutoExport")
+        }
 
         // Webhook Settings
         self._webhookEnabled = defaults.bool(forKey: "webhookEnabled")

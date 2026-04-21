@@ -1924,6 +1924,9 @@ struct NotesView: View {
         case .cleaned:
             showOriginalButton(controller: controller, state: state)
         }
+        if settings.appleNotesEnabled, state.loadedNotes != nil {
+            appleNotesSyncButton(controller: controller, state: state)
+        }
     }
 
     @ViewBuilder
