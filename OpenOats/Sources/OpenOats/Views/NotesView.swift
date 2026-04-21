@@ -2018,24 +2018,25 @@ struct NotesView: View {
         } label: {
             switch appleNotesSyncState {
             case .idle:
-                Label(appleNotesLastSyncDate != nil ? "Re-sync" : "Apple Notes", systemImage: "note.text")
+                Label("Notes", systemImage: "square.and.arrow.up")
                     .font(.system(size: 12))
             case .syncing:
-                Label("Syncing…", systemImage: "arrow.triangle.2.circlepath")
+                Label("Exporting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.system(size: 12))
             case .success:
-                Label("Synced", systemImage: "checkmark")
+                Label("Exported", systemImage: "checkmark")
                     .font(.system(size: 12))
             case .failed:
-                Label("Sync Failed", systemImage: "exclamationmark.triangle")
+                Label("Export Failed", systemImage: "exclamationmark.triangle")
                     .font(.system(size: 12))
             }
         }
         .buttonStyle(.bordered)
         .tint(appleNotesSyncState == .success ? .green : appleNotesSyncState == .failed ? .red : nil)
         .disabled(appleNotesSyncState == .syncing)
-        .help(appleNotesLastSyncDate.map { "Last synced \($0.formatted(.relative(presentation: .named))). Syncing again will overwrite the note." }
-              ?? "Export current notes to Apple Notes")
+        .help(appleNotesLastSyncDate.map {
+            "Last exported to Apple Notes \($0.formatted(.relative(presentation: .named))). Exporting again will overwrite the existing note."
+        } ?? "Export these notes to Apple Notes. The note will be created in your \"\(settings.appleNotesFolderName.isEmpty ? "OpenOats" : settings.appleNotesFolderName)\" folder.")
     }
 
     @ViewBuilder
