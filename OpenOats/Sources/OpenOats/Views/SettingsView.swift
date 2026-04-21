@@ -888,7 +888,7 @@ private struct IntegrationsSettingsTab: View {
         ScrollView {
             Form {
                 Section("Apple Notes") {
-                    Toggle("Export to Apple Notes when meeting ends", isOn: $settings.appleNotesEnabled)
+                    Toggle("Enable Apple Notes export", isOn: $settings.appleNotesEnabled)
                         .font(.system(size: 12))
                         .onChange(of: settings.appleNotesEnabled) { _, enabled in
                             if enabled {
@@ -902,7 +902,7 @@ private struct IntegrationsSettingsTab: View {
                             }
                         }
 
-                    Text("Creates or updates a note in Apple Notes after each meeting. Use the \"Sync to Apple Notes\" button in the Notes view to push updated notes after regeneration.")
+                    Text("Creates or updates a note in Apple Notes for each meeting. Use the \"Sync to Apple Notes\" button in the Notes view to push updated notes manually.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
@@ -918,6 +918,12 @@ private struct IntegrationsSettingsTab: View {
                     }
 
                     if settings.appleNotesEnabled {
+                        Toggle("Auto-export when meeting ends", isOn: $settings.appleNotesAutoExport)
+                            .font(.system(size: 12))
+                        Text("When disabled, notes are only synced when you click \"Sync to Apple Notes\" manually.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+
                         Toggle("Include transcript", isOn: $settings.appleNotesIncludeTranscript)
                             .font(.system(size: 12))
 
