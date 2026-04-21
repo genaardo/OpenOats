@@ -20,9 +20,10 @@ final class LiveSessionState {
     var batchIsImporting: Bool = false
     var lastEndedSession: SessionIndex? = nil
     var lastSessionHasNotes: Bool = false
-    var kbIndexingProgress: String = ""
+    var kbIndexingStatus: KnowledgeBaseIndexingStatus = .idle
     var statusMessage: String? = nil
     var errorMessage: String? = nil
+    var matchedCalendarEvent: CalendarEvent? = nil
     var needsDownload: Bool = false
     var downloadProgress: Double? = nil
     var downloadDetail: DownloadProgressDetail? = nil
@@ -47,6 +48,7 @@ final class LiveSessionController {
 
     private var downloadTask: Task<Void, Never>?
     private var scratchpadSaveTask: Task<Void, Never>?
+    private var pendingInitialScratchpad: String?
 
     // Tracked-change sentinels
     private var observedUtteranceCount = 0
@@ -88,6 +90,7 @@ final class LiveSessionController {
         while !Task.isCancelled {
             let isActive = coordinator.transcriptionEngine?.isRunning == true
                 || coordinator.batchStatus != .idle
+                || coordinator.knowledgeBase?.indexingStatus.needsFrequentPolling == true
             try? await Task.sleep(for: isActive ? .milliseconds(250) : .seconds(2))
 
             // Poll batch engine status (actor-isolated)
@@ -122,12 +125,18 @@ final class LiveSessionController {
 
     // MARK: - Session Actions
 
-    func startSession(settings: AppSettings) {
+    func startSession(
+        settings: AppSettings,
+        calendarEventOverride: CalendarEvent? = nil,
+        initialScratchpad: String? = nil
+    ) {
+        guard !state.isRunning else { return }
         coordinator.suggestionEngine?.clear()
         coordinator.sidecastEngine?.clear()
-        let calEvent = settings.calendarIntegrationEnabled
+        let calEvent = calendarEventOverride ?? (settings.calendarIntegrationEnabled
             ? container.calendarManager?.currentEvent()
-            : nil
+            : nil)
+        pendingInitialScratchpad = initialScratchpad?.trimmingCharacters(in: .newlines)
         let metadata = MeetingMetadata.manual(calendarEvent: calEvent)
         coordinator.handle(.userStarted(metadata), settings: settings)
     }
@@ -172,6 +181,9 @@ final class LiveSessionController {
     func indexKBIfNeeded(settings: AppSettings) {
         guard let url = settings.kbFolderURL, let kb = coordinator.knowledgeBase else { return }
         Task {
+            // TODO: Coalesce repeated startup/settings-triggered reindex requests into a
+            // single in-flight task. Today ContentView startup, kbFolderPath changes, and
+            // Voyage key changes can all arrive close together and redo the same cold-start scan.
             kb.clear()
             await kb.index(folderURL: url)
         }
@@ -184,11 +196,15 @@ final class LiveSessionController {
         let handled: Bool
 
         switch request.command {
-        case .startSession:
+        case .startSession(let calendarEvent, let scratchpadSeed):
             guard coordinator.transcriptionEngine != nil,
                   (coordinator.suggestionEngine != nil || coordinator.sidecastEngine != nil) else { return }
             if !state.isRunning {
-                startSession(settings: settings)
+                startSession(
+                    settings: settings,
+                    calendarEventOverride: calendarEvent,
+                    initialScratchpad: scratchpadSeed
+                )
             }
             handled = true
         case .stopSession:
@@ -303,7 +319,12 @@ final class LiveSessionController {
             )
         )
         _currentSessionID = handle.sessionID
-        state.scratchpadText = ""
+        let initialScratchpad = pendingInitialScratchpad?.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingInitialScratchpad = nil
+        state.scratchpadText = initialScratchpad ?? ""
+        if let initialScratchpad, !initialScratchpad.isEmpty {
+            await coordinator.sessionRepository.saveScratchpad(sessionID: handle.sessionID, text: initialScratchpad)
+        }
 
         if let settings {
             if settings.saveAudioRecording || settings.enableBatchRetranscription {
@@ -350,15 +371,16 @@ final class LiveSessionController {
         }
         let utterancesSnapshot = coordinator.transcriptStore.utterances
         let utteranceCount = utterancesSnapshot.count
-        let title = coordinator.transcriptStore.conversationState.currentTopic.isEmpty
-            ? nil : coordinator.transcriptStore.conversationState.currentTopic
-
-        let meetingAppName: String?
+        let endingMetadata: MeetingMetadata?
         if case .ending(let metadata) = coordinator.state {
-            meetingAppName = metadata.detectionContext?.meetingApp?.name
+            endingMetadata = metadata
         } else {
-            meetingAppName = nil
+            endingMetadata = nil
         }
+        let metadataTitle = endingMetadata?.title ?? endingMetadata?.calendarEvent?.title
+        let title = coordinator.transcriptStore.conversationState.currentTopic.isEmpty
+            ? metadataTitle : coordinator.transcriptStore.conversationState.currentTopic
+        let meetingAppName = endingMetadata?.detectionContext?.meetingApp?.name
 
         let engineName = settings?.transcriptionModel.rawValue
         let transcriptionLanguage: String? = {
@@ -377,9 +399,16 @@ final class LiveSessionController {
                 meetingApp: meetingAppName,
                 engine: engineName,
                 templateSnapshot: coordinator.sessionTemplateSnapshot,
-                utterances: utterancesSnapshot
+                utterances: utterancesSnapshot,
+                calendarEvent: endingMetadata?.calendarEvent
             )
         )
+
+        if let settings,
+           let event = endingMetadata?.calendarEvent,
+           let folderPath = settings.meetingFamilyPreferences(for: event)?.folderPath {
+            await coordinator.sessionRepository.updateSessionFolder(sessionID: sessionID, folderPath: folderPath)
+        }
 
         // 5. Build index for UI state
         let index = SessionIndex(
@@ -451,7 +480,8 @@ final class LiveSessionController {
                         micStartDate: anchorsData.micStartDate,
                         sysStartDate: anchorsData.sysStartDate,
                         micAnchors: anchorsData.micAnchors,
-                        sysAnchors: anchorsData.sysAnchors
+                        sysAnchors: anchorsData.sysAnchors,
+                        sysEffectiveSampleRate: anchorsData.sysEffectiveSampleRate
                     )
                 )
 
@@ -466,7 +496,8 @@ final class LiveSessionController {
                         micStartDate: sealed.micStartDate,
                         sysStartDate: sealed.sysStartDate,
                         micAnchors: sealed.micAnchors,
-                        sysAnchors: sealed.sysAnchors
+                        sysAnchors: sealed.sysAnchors,
+                        sysEffectiveSampleRate: sealed.sysEffectiveSampleRate
                     )
                 )
             } else if wantsExport {
@@ -474,14 +505,23 @@ final class LiveSessionController {
             }
         }
 
-        // 7. Update UI state + refresh history
-        coordinator.lastEndedSession = index
+        // 7. Collapse obviously empty duplicate sessions back into the real meeting session.
+        var effectiveIndex = index
+        var shouldRunBatchRetranscription = settings?.enableBatchRetranscription == true
+        if utteranceCount == 0,
+           let mergedSessionID = await coordinator.sessionRepository.reconcileGhostSession(sessionID: sessionID) {
+            effectiveIndex = await coordinator.sessionRepository.loadSession(id: mergedSessionID).index
+            shouldRunBatchRetranscription = false
+        }
+
+        // 8. Update UI state + refresh history
+        coordinator.lastEndedSession = effectiveIndex
         coordinator.sessionTemplateSnapshot = nil
         _currentSessionID = nil
         await coordinator.loadHistory()
 
-        // 8. Kick off batch transcription if enabled
-        if let settings, settings.enableBatchRetranscription, let batchAudioTranscriber = coordinator.batchAudioTranscriber {
+        // 9. Kick off batch transcription if enabled
+        if let settings, shouldRunBatchRetranscription, let batchAudioTranscriber = coordinator.batchAudioTranscriber {
             let batchSessionID = sessionID
             let batchModel = settings.batchTranscriptionModel
             let batchLocale = settings.locale
@@ -548,6 +588,13 @@ final class LiveSessionController {
         }
 
         let isRunning = coordinator.transcriptionEngine?.isRunning ?? false
+        let matchedCalendarEvent: CalendarEvent?
+        switch coordinator.state {
+        case .recording(let metadata), .ending(let metadata):
+            matchedCalendarEvent = metadata.calendarEvent
+        case .idle:
+            matchedCalendarEvent = nil
+        }
 
         // Use set(_:_:) for all Equatable fields: only fires @Observable withMutation
         // when the value actually changed, preventing spurious layout passes on NSHostingView.
@@ -561,9 +608,10 @@ final class LiveSessionController {
         set(\.batchIsImporting, coordinator.batchIsImporting)
         if state.lastEndedSession?.id != lastEndedSession?.id { state.lastEndedSession = lastEndedSession }
         set(\.lastSessionHasNotes, lastSessionHasNotes)
-        set(\.kbIndexingProgress, coordinator.knowledgeBase?.indexingProgress ?? "")
+        set(\.kbIndexingStatus, coordinator.knowledgeBase?.indexingStatus ?? .idle)
         set(\.statusMessage, coordinator.transcriptionEngine?.assetStatus)
         set(\.errorMessage, coordinator.transcriptionEngine?.lastError)
+        set(\.matchedCalendarEvent, matchedCalendarEvent)
         set(\.needsDownload, coordinator.transcriptionEngine?.needsModelDownload ?? false)
         set(\.downloadProgress, coordinator.transcriptionEngine?.downloadProgress)
         set(\.transcriptionPrompt, settings.transcriptionModel.downloadPrompt)
@@ -626,9 +674,13 @@ final class LiveSessionController {
             }
         }
 
-        if settings.voyageApiKey != observedVoyageApiKey {
+        if !settings.kbFolderPath.isEmpty,
+           settings.embeddingProvider == .voyageAI,
+           settings.voyageApiKey != observedVoyageApiKey {
             observedVoyageApiKey = settings.voyageApiKey
             indexKBIfNeeded(settings: settings)
+        } else if settings.kbFolderPath.isEmpty || settings.embeddingProvider != .voyageAI {
+            observedVoyageApiKey = ""
         }
 
         if settings.transcriptionModel != observedTranscriptionModel {

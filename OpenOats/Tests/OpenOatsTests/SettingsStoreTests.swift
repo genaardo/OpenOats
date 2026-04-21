@@ -3,6 +3,10 @@ import XCTest
 
 @MainActor
 final class SettingsStoreTests: XCTestCase {
+    private final class LoadTracker: @unchecked Sendable {
+        var loadedKeys: [String] = []
+        var savedValues: [String: String] = [:]
+    }
 
     /// Build a SettingsStore backed by an ephemeral UserDefaults suite.
     private func makeStore(
@@ -274,6 +278,17 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(store.detectionLogEnabled)
     }
 
+    func testDefaultShareCalendarContextWithCloudNotes() {
+        let store = makeStore()
+        XCTAssertFalse(store.shareCalendarContextWithCloudNotes)
+    }
+
+    func testShareCalendarContextWithCloudNotesRoundTrip() {
+        let store = makeStore()
+        store.shareCalendarContextWithCloudNotes = true
+        XCTAssertTrue(store.shareCalendarContextWithCloudNotes)
+    }
+
     // MARK: - Privacy Settings Group
 
     func testDefaultHasAcknowledgedRecordingConsent() {
@@ -305,6 +320,203 @@ final class SettingsStoreTests: XCTestCase {
         let store = makeStore()
         store.showLiveTranscript = false
         XCTAssertFalse(store.showLiveTranscript)
+    }
+
+    func testDefaultNotesFolders() {
+        let store = makeStore()
+        XCTAssertEqual(store.notesFolders, [])
+    }
+
+    func testNotesFoldersRoundTrip() {
+        let store = makeStore()
+        store.notesFolders = [
+            NotesFolderDefinition(path: "Work/1:1s", color: .orange),
+            NotesFolderDefinition(path: "Personal", color: .purple),
+        ]
+        XCTAssertEqual(store.notesFolders.map(\.path), ["Personal", "Work/1:1s"])
+        XCTAssertEqual(store.notesFolders.map(\.color), [.purple, .orange])
+    }
+
+    func testNotesFoldersNormalizeAndDedupePaths() {
+        let store = makeStore()
+        store.notesFolders = [
+            NotesFolderDefinition(path: " Work // 1:1s / Bertie / ", color: .teal),
+            NotesFolderDefinition(path: "work/1:1s/bertie", color: .orange),
+            NotesFolderDefinition(path: " / ./ ", color: .purple),
+        ]
+        XCTAssertEqual(store.notesFolders.map(\.path), ["Work/1:1s/Bertie"])
+        XCTAssertEqual(store.notesFolders.map(\.color), [.teal])
+    }
+
+    func testMeetingPrepNotesRoundTripAndClear() {
+        let store = makeStore()
+        let event = CalendarEvent(
+            id: "evt",
+            title: "Payment Ops",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+
+        XCTAssertEqual(store.meetingPrepNotes(for: event), "")
+
+        store.setMeetingPrepNotes("Follow up on merchant fees", for: event)
+        XCTAssertEqual(store.meetingPrepNotes(for: event), "Follow up on merchant fees")
+
+        store.setMeetingPrepNotes("   ", for: event)
+        XCTAssertEqual(store.meetingPrepNotes(for: event), "")
+        XCTAssertEqual(store.meetingPrepNotesByKey, [:])
+    }
+
+    func testMeetingHistoryAliasesNormalizeAndCanonicalizePrepNotes() {
+        let store = makeStore()
+        store.meetingHistoryAliasesByKey = [
+            " Payment Ops ": "payment ops merchant standup",
+            "payment ops merchant standup": "payment ops merchant standup",
+            "": "ignored",
+        ]
+
+        XCTAssertEqual(
+            store.meetingHistoryAliasesByKey,
+            ["payment ops": "payment ops merchant standup"]
+        )
+
+        let renamedEvent = CalendarEvent(
+            id: "evt-renamed",
+            title: "Payment Ops / Merchant standup",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+        let legacyEvent = CalendarEvent(
+            id: "evt-legacy",
+            title: "Payment Ops",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+
+        store.setMeetingPrepNotes("Carry this forward", for: renamedEvent)
+
+        XCTAssertEqual(store.meetingPrepNotes(for: legacyEvent), "Carry this forward")
+        XCTAssertEqual(
+            store.canonicalMeetingHistoryKey(for: legacyEvent),
+            MeetingHistoryResolver.historyKey(for: renamedEvent)
+        )
+    }
+
+    func testMeetingFamilyTemplatePreferenceCanonicalizesThroughAliases() {
+        let store = makeStore()
+        store.meetingHistoryAliasesByKey = [
+            "payment ops": "payment ops merchant standup",
+        ]
+
+        let renamedEvent = CalendarEvent(
+            id: "evt-renamed",
+            title: "Payment Ops / Merchant standup",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+        let legacyEvent = CalendarEvent(
+            id: "evt-legacy",
+            title: "Payment Ops",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+
+        store.setMeetingFamilyTemplatePreference(TemplateStore.standUpID, for: renamedEvent)
+
+        XCTAssertEqual(
+            store.meetingFamilyPreferences(for: legacyEvent)?.templateID,
+            TemplateStore.standUpID
+        )
+        XCTAssertEqual(
+            store.meetingFamilyPreferencesByKey[MeetingHistoryResolver.historyKey(for: renamedEvent)]?.templateID,
+            TemplateStore.standUpID
+        )
+
+        store.setMeetingFamilyTemplatePreference(nil, for: legacyEvent)
+        XCTAssertNil(store.meetingFamilyPreferences(for: renamedEvent))
+        XCTAssertTrue(store.meetingFamilyPreferencesByKey.isEmpty)
+    }
+
+    func testMeetingFamilyFolderPreferenceCanonicalizesThroughAliases() {
+        let store = makeStore()
+        store.meetingHistoryAliasesByKey = [
+            "payment ops": "payment ops merchant standup",
+        ]
+
+        let renamedEvent = CalendarEvent(
+            id: "evt-renamed",
+            title: "Payment Ops / Merchant standup",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+        let legacyEvent = CalendarEvent(
+            id: "evt-legacy",
+            title: "Payment Ops",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+
+        store.setMeetingFamilyFolderPreference("Work/Payments", for: renamedEvent)
+
+        XCTAssertEqual(
+            store.meetingFamilyPreferences(for: legacyEvent)?.folderPath,
+            "Work/Payments"
+        )
+        XCTAssertEqual(
+            store.meetingFamilyPreferencesByKey[MeetingHistoryResolver.historyKey(for: renamedEvent)]?.folderPath,
+            "Work/Payments"
+        )
+
+        store.setMeetingFamilyFolderPreference(nil, for: legacyEvent)
+        XCTAssertNil(store.meetingFamilyPreferences(for: renamedEvent))
+        XCTAssertTrue(store.meetingFamilyPreferencesByKey.isEmpty)
+    }
+
+    func testMeetingFamilyFolderPreferenceRejectsPathsDeeperThanOneSubfolder() {
+        let store = makeStore()
+        let event = CalendarEvent(
+            id: "evt",
+            title: "Payment Ops",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            organizer: nil,
+            participants: [],
+            isOnlineMeeting: false,
+            meetingURL: nil
+        )
+
+        store.setMeetingFamilyFolderPreference("Work/Payments/Merchant Standup", for: event)
+
+        XCTAssertNil(store.meetingFamilyPreferences(for: event))
+        XCTAssertTrue(store.meetingFamilyPreferencesByKey.isEmpty)
     }
 
     func testKbFolderURLWhenEmpty() {
@@ -381,6 +593,36 @@ final class SettingsStoreTests: XCTestCase {
 
     func testStorageTypealiasCompiles() {
         let _: AppSettingsStorage.Type = SettingsStorage.self
+    }
+
+    func testSecretsLoadLazily() {
+        let tracker = LoadTracker()
+        let secretStore = AppSecretStore(
+            loadValue: { key in
+                tracker.loadedKeys.append(key)
+                return key == "openRouterApiKey" ? "sk-existing" : nil
+            },
+            saveValue: { key, value in
+                tracker.savedValues[key] = value
+            }
+        )
+
+        let store = makeStore(secretStore: secretStore)
+
+        XCTAssertTrue(tracker.loadedKeys.isEmpty)
+        XCTAssertEqual(store.llmProvider, .openRouter)
+        XCTAssertTrue(tracker.loadedKeys.isEmpty)
+
+        XCTAssertEqual(store.openRouterApiKey, "sk-existing")
+        XCTAssertEqual(tracker.loadedKeys, ["openRouterApiKey"])
+
+        XCTAssertEqual(store.openRouterApiKey, "sk-existing")
+        XCTAssertEqual(tracker.loadedKeys, ["openRouterApiKey"])
+
+        store.openRouterApiKey = " sk-updated "
+        XCTAssertEqual(store.openRouterApiKey, "sk-updated")
+        XCTAssertEqual(tracker.loadedKeys, ["openRouterApiKey"])
+        XCTAssertEqual(tracker.savedValues["openRouterApiKey"], "sk-updated")
     }
 
     // MARK: - Cloud ASR API Keys

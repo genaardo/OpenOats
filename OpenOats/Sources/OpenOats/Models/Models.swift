@@ -342,6 +342,31 @@ struct GeneratedNotes: Codable, Sendable {
     let markdown: String
 }
 
+enum SessionAudioSourceKind: String, Sendable, Hashable {
+    case recording
+    case system
+    case microphone
+
+    var displayName: String {
+        switch self {
+        case .recording:
+            return "Recording"
+        case .system:
+            return "System audio"
+        case .microphone:
+            return "Microphone"
+        }
+    }
+}
+
+struct SessionAudioSource: Identifiable, Sendable, Hashable {
+    let kind: SessionAudioSourceKind
+    let url: URL
+
+    var id: String { "\(kind.rawValue):\(url.path)" }
+    var displayName: String { kind.displayName }
+}
+
 struct SessionIndex: Identifiable, Codable, Sendable {
     let id: String
     let startedAt: Date
@@ -358,6 +383,8 @@ struct SessionIndex: Identifiable, Codable, Sendable {
     var engine: String?
     /// User-assigned tags for session organization.
     var tags: [String]?
+    /// Optional slash-separated folder path used to organize sessions in the Notes UI.
+    var folderPath: String? = nil
     /// How the session was created (nil for live sessions, "imported" for imported audio).
     var source: String?
 }

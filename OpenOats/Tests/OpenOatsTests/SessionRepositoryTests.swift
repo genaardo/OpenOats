@@ -6,6 +6,25 @@ final class SessionRepositoryTests: XCTestCase {
     private var repo: SessionRepository!
     private var rootDir: URL!
 
+    private func makeCalendarEvent() -> CalendarEvent {
+        CalendarEvent(
+            id: "event-123",
+            title: "Customer Sync",
+            startDate: Date(timeIntervalSince1970: 1_700_000_000),
+            endDate: Date(timeIntervalSince1970: 1_700_000_900),
+            calendarID: "calendar-123",
+            calendarTitle: "Customer Meetings",
+            calendarColorHex: "#3366FF",
+            organizer: "Aly",
+            participants: [
+                Participant(name: "Aly", email: "aly@example.com"),
+                Participant(name: "Nima", email: "nima@example.com"),
+            ],
+            isOnlineMeeting: true,
+            meetingURL: URL(string: "https://meet.example.com/customer-sync")
+        )
+    }
+
     override func setUp() async throws {
         rootDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("OpenOatsRepoTests", isDirectory: true)
@@ -97,6 +116,7 @@ final class SessionRepositoryTests: XCTestCase {
         let handle = await repo.startSession()
         let sessionID = handle.sessionID
         let startDate = Date()
+        let calendarEvent = makeCalendarEvent()
 
         let utterance = Utterance(text: "Test", speaker: .you, timestamp: startDate)
         await repo.appendLiveUtterance(sessionID: sessionID, utterance: utterance)
@@ -111,7 +131,8 @@ final class SessionRepositoryTests: XCTestCase {
                 meetingApp: "Zoom",
                 engine: "parakeetV2",
                 templateSnapshot: nil,
-                utterances: [utterance]
+                utterances: [utterance],
+                calendarEvent: calendarEvent
             )
         )
 
@@ -124,6 +145,13 @@ final class SessionRepositoryTests: XCTestCase {
         XCTAssertEqual(found?.engine, "parakeetV2")
         XCTAssertEqual(found?.utteranceCount, 1)
         XCTAssertNotNil(found?.endedAt)
+
+        let session = await repo.loadSession(id: sessionID)
+        XCTAssertEqual(session.calendarEvent?.title, "Customer Sync")
+        XCTAssertEqual(session.calendarEvent?.calendarID, "calendar-123")
+        XCTAssertEqual(session.calendarEvent?.calendarTitle, "Customer Meetings")
+        XCTAssertEqual(session.calendarEvent?.calendarColorHex, "#3366FF")
+        XCTAssertEqual(session.calendarEvent?.participants.count, 2)
 
         await repo.deleteSession(sessionID: sessionID)
     }
@@ -275,6 +303,23 @@ final class SessionRepositoryTests: XCTestCase {
         await repo.deleteSession(sessionID: sessionID)
     }
 
+    func testUpdateSessionFolderPersistsNormalizedPath() async {
+        let sessionID = "session_folder_test"
+        await repo.seedSession(
+            id: sessionID,
+            records: [SessionRecord(speaker: .you, text: "Hello", timestamp: Date())],
+            startedAt: Date()
+        )
+
+        await repo.updateSessionFolder(sessionID: sessionID, folderPath: " Work // 1:1s / ./ Bertie / ")
+
+        let sessions = await repo.listSessions()
+        let found = sessions.first(where: { $0.id == sessionID })
+        XCTAssertEqual(found?.folderPath, "Work/1:1s/Bertie")
+
+        await repo.deleteSession(sessionID: sessionID)
+    }
+
     // MARK: - renameSession updates metadata
 
     func testRenameSessionUpdatesMetadata() async {
@@ -416,15 +461,17 @@ final class SessionRepositoryTests: XCTestCase {
 
     func testSaveFinalTranscript() async {
         let sessionID = "session_final_test"
+        let initialStart = Date(timeIntervalSince1970: 100)
         await repo.seedSession(
             id: sessionID,
-            records: [SessionRecord(speaker: .you, text: "Live", timestamp: Date())],
-            startedAt: Date()
+            records: [SessionRecord(speaker: .you, text: "Live", timestamp: initialStart)],
+            startedAt: initialStart
         )
 
+        let finalStart = Date(timeIntervalSince1970: 200)
         let finalRecords = [
-            SessionRecord(speaker: .you, text: "Final A", timestamp: Date()),
-            SessionRecord(speaker: .them, text: "Final B", timestamp: Date()),
+            SessionRecord(speaker: .you, text: "Final A", timestamp: finalStart),
+            SessionRecord(speaker: .them, text: "Final B", timestamp: finalStart.addingTimeInterval(12)),
         ]
         await repo.saveFinalTranscript(sessionID: sessionID, records: finalRecords)
 
@@ -438,7 +485,256 @@ final class SessionRepositoryTests: XCTestCase {
         XCTAssertEqual(live.count, 1)
         XCTAssertEqual(live[0].text, "Live")
 
+        let sessions = await repo.listSessions()
+        let saved = sessions.first(where: { $0.id == sessionID })
+        XCTAssertEqual(saved?.utteranceCount, finalRecords.count)
+        XCTAssertEqual(saved?.startedAt, finalStart)
+        XCTAssertEqual(saved?.endedAt, finalStart.addingTimeInterval(12))
+
         await repo.deleteSession(sessionID: sessionID)
+    }
+
+    func testSaveFinalTranscriptPreservesCalendarEvent() async {
+        let handle = await repo.startSession()
+        let sessionID = handle.sessionID
+        let startDate = Date(timeIntervalSince1970: 1_000)
+        let calendarEvent = makeCalendarEvent()
+
+        let utterance = Utterance(text: "Live", speaker: .you, timestamp: startDate)
+        await repo.appendLiveUtterance(sessionID: sessionID, utterance: utterance)
+
+        await repo.finalizeSession(
+            sessionID: sessionID,
+            metadata: SessionFinalizeMetadata(
+                endedAt: startDate.addingTimeInterval(30),
+                utteranceCount: 1,
+                title: "Customer Sync",
+                language: "en-GB",
+                meetingApp: "Zoom",
+                engine: "parakeetV2",
+                templateSnapshot: nil,
+                utterances: [utterance],
+                calendarEvent: calendarEvent
+            )
+        )
+
+        let finalRecords = [
+            SessionRecord(speaker: .you, text: "Final A", timestamp: startDate),
+            SessionRecord(speaker: .them, text: "Final B", timestamp: startDate.addingTimeInterval(12)),
+        ]
+        await repo.saveFinalTranscript(sessionID: sessionID, records: finalRecords)
+
+        let session = await repo.loadSession(id: sessionID)
+        XCTAssertEqual(session.calendarEvent?.id, calendarEvent.id)
+        XCTAssertEqual(session.calendarEvent?.title, calendarEvent.title)
+        XCTAssertEqual(session.calendarEvent?.calendarTitle, calendarEvent.calendarTitle)
+
+        await repo.deleteSession(sessionID: sessionID)
+    }
+
+    func testReconcileGhostSessionMergesCalendarEventIntoRecentRealSession() async {
+        let calendarEvent = makeCalendarEvent()
+        let realStartedAt = Date().addingTimeInterval(-180)
+        let realEndedAt = realStartedAt.addingTimeInterval(60)
+
+        await repo.seedSession(
+            id: "session_real",
+            records: [SessionRecord(speaker: .you, text: "Hello", timestamp: realStartedAt)],
+            startedAt: realStartedAt,
+            endedAt: realEndedAt,
+            title: "Customer Sync"
+        )
+
+        let ghostHandle = await repo.startSession()
+        await repo.finalizeSession(
+            sessionID: ghostHandle.sessionID,
+            metadata: SessionFinalizeMetadata(
+                endedAt: realEndedAt.addingTimeInterval(120),
+                utteranceCount: 0,
+                title: "Customer Sync",
+                language: nil,
+                meetingApp: nil,
+                engine: nil,
+                templateSnapshot: nil,
+                utterances: [],
+                calendarEvent: calendarEvent
+            )
+        )
+
+        let mergedSessionID = await repo.reconcileGhostSession(sessionID: ghostHandle.sessionID)
+
+        XCTAssertEqual(mergedSessionID, "session_real")
+        let sessions = await repo.listSessions()
+        XCTAssertEqual(sessions.filter { $0.title == "Customer Sync" }.map(\.id), ["session_real"])
+
+        let mergedDetail = await repo.loadSession(id: "session_real")
+        XCTAssertEqual(mergedDetail.calendarEvent?.id, calendarEvent.id)
+
+        await repo.deleteSession(sessionID: "session_real")
+    }
+
+    func testReconcileGhostSessionKeepsEmptySessionWhenAudioArtifactsExist() async throws {
+        let calendarEvent = makeCalendarEvent()
+        let realStartedAt = Date().addingTimeInterval(-180)
+        let realEndedAt = realStartedAt.addingTimeInterval(60)
+
+        await repo.seedSession(
+            id: "session_real",
+            records: [SessionRecord(speaker: .you, text: "Hello", timestamp: realStartedAt)],
+            startedAt: realStartedAt,
+            endedAt: realEndedAt,
+            title: "Customer Sync"
+        )
+
+        let ghostHandle = await repo.startSession()
+        await repo.finalizeSession(
+            sessionID: ghostHandle.sessionID,
+            metadata: SessionFinalizeMetadata(
+                endedAt: realEndedAt.addingTimeInterval(120),
+                utteranceCount: 0,
+                title: "Customer Sync",
+                language: nil,
+                meetingApp: nil,
+                engine: nil,
+                templateSnapshot: nil,
+                utterances: [],
+                calendarEvent: calendarEvent
+            )
+        )
+
+        let audioDir = rootDir
+            .appendingPathComponent("sessions", isDirectory: true)
+            .appendingPathComponent(ghostHandle.sessionID, isDirectory: true)
+            .appendingPathComponent("audio", isDirectory: true)
+        try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+        try Data("mic".utf8).write(to: audioDir.appendingPathComponent("mic.caf"), options: .atomic)
+
+        let mergedSessionID = await repo.reconcileGhostSession(sessionID: ghostHandle.sessionID)
+
+        XCTAssertNil(mergedSessionID)
+        let sessions = await repo.listSessions()
+        XCTAssertTrue(sessions.contains(where: { $0.id == ghostHandle.sessionID }))
+        let realDetail = await repo.loadSession(id: "session_real")
+        XCTAssertNil(realDetail.calendarEvent)
+
+        await repo.deleteSession(sessionID: ghostHandle.sessionID)
+        await repo.deleteSession(sessionID: "session_real")
+    }
+
+    func testBatchMetaPersistsEffectiveSystemSampleRate() async {
+        let sessionID = "session_batch_meta"
+        await repo.seedSession(
+            id: sessionID,
+            records: [SessionRecord(speaker: .you, text: "Live", timestamp: Date())],
+            startedAt: Date()
+        )
+
+        let tempDir = rootDir.appendingPathComponent("batch_temp", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let micURL = tempDir.appendingPathComponent("mic.caf")
+        let sysURL = tempDir.appendingPathComponent("sys.caf")
+        FileManager.default.createFile(atPath: micURL.path, contents: Data())
+        FileManager.default.createFile(atPath: sysURL.path, contents: Data())
+
+        await repo.stashAudioForBatch(
+            sessionID: sessionID,
+            micURL: micURL,
+            sysURL: sysURL,
+            anchors: BatchAnchors(
+                micStartDate: Date(timeIntervalSince1970: 10),
+                sysStartDate: Date(timeIntervalSince1970: 20),
+                micAnchors: [(frame: 0, date: Date(timeIntervalSince1970: 10))],
+                sysAnchors: [(frame: 0, date: Date(timeIntervalSince1970: 20))],
+                sysEffectiveSampleRate: 24_000
+            )
+        )
+
+        let meta = await repo.loadBatchMeta(sessionID: sessionID)
+        XCTAssertEqual(meta?.sysEffectiveSampleRate, 24_000)
+
+        await repo.deleteSession(sessionID: sessionID)
+    }
+
+    func testUpdateSessionTagsPreservesInternalGranolaTag() async {
+        let sessionID = "session_granola_tags"
+        await repo.seedSession(
+            id: sessionID,
+            records: [SessionRecord(speaker: .you, text: "Live", timestamp: Date())],
+            startedAt: Date()
+        )
+
+        await repo.updateSessionSource(
+            sessionID: sessionID,
+            source: "granola",
+            tags: ["granola:not_123"]
+        )
+        await repo.updateSessionTags(sessionID: sessionID, tags: ["team", "follow-up"])
+
+        let sessions = await repo.listSessions()
+        let saved = sessions.first(where: { $0.id == sessionID })
+
+        XCTAssertEqual(saved?.source, "granola")
+        XCTAssertEqual(saved?.tags ?? [], ["granola:not_123", "team", "follow-up"])
+
+        await repo.deleteSession(sessionID: sessionID)
+    }
+
+    func testInitRetainsRecentBatchAudioForRerunWindow() async throws {
+        let sessionID = "session_recent_batch_audio"
+        let sessionDir = try makeSessionWithBatchAudio(sessionID: sessionID)
+        try setModificationDate(
+            Date().addingTimeInterval(-(6 * 24 * 3600)),
+            forSessionDirectory: sessionDir
+        )
+
+        let freshRepo = SessionRepository(rootDirectory: rootDir)
+        let urls = await freshRepo.batchAudioURLs(sessionID: sessionID)
+        let meta = await freshRepo.loadBatchMeta(sessionID: sessionID)
+
+        XCTAssertNotNil(urls.mic)
+        XCTAssertNotNil(urls.sys)
+        XCTAssertNotNil(meta)
+    }
+
+    func testInitCleansExpiredBatchAudioAfterRerunWindow() async throws {
+        let sessionID = "session_expired_batch_audio"
+        let sessionDir = try makeSessionWithBatchAudio(sessionID: sessionID)
+        try setModificationDate(
+            Date().addingTimeInterval(-(8 * 24 * 3600)),
+            forSessionDirectory: sessionDir
+        )
+
+        let freshRepo = SessionRepository(rootDirectory: rootDir)
+        let urls = await freshRepo.batchAudioURLs(sessionID: sessionID)
+        let meta = await freshRepo.loadBatchMeta(sessionID: sessionID)
+
+        XCTAssertNil(urls.mic)
+        XCTAssertNil(urls.sys)
+        XCTAssertNil(meta)
+    }
+
+    func testAudioSourcesExposeRawBatchAudioFiles() async throws {
+        let sessionID = "session_batch_audio_sources"
+        _ = try makeSessionWithBatchAudio(sessionID: sessionID)
+
+        let sources = await repo.audioSources(for: sessionID)
+        let defaultAudioURL = await repo.audioFileURL(for: sessionID)
+
+        XCTAssertEqual(sources.map(\.kind), [.system, .microphone])
+        XCTAssertEqual(sources.first?.url.lastPathComponent, "sys.caf")
+        XCTAssertEqual(sources.last?.url.lastPathComponent, "mic.caf")
+        XCTAssertEqual(defaultAudioURL?.lastPathComponent, "sys.caf")
+    }
+
+    func testAudioSourcesIgnoreTranscriptBackupFiles() async throws {
+        let sessionID = "session_ignores_transcript_backup"
+        let sessionDir = try makeSessionWithBatchAudio(sessionID: sessionID)
+        let backupURL = sessionDir.appendingPathComponent("transcript.live.jsonl.pre-cleanup.bak")
+        try Data().write(to: backupURL, options: .atomic)
+
+        let sources = await repo.audioSources(for: sessionID)
+
+        XCTAssertEqual(sources.map(\.kind), [.system, .microphone])
     }
 
     // MARK: - moveToRecentlyDeleted
@@ -455,6 +751,50 @@ final class SessionRepositoryTests: XCTestCase {
 
         let sessions = await repo.listSessions()
         XCTAssertFalse(sessions.contains(where: { $0.id == sessionID }))
+    }
+
+    private func makeSessionWithBatchAudio(sessionID: String) throws -> URL {
+        let sessionsDir = rootDir.appendingPathComponent("sessions", isDirectory: true)
+        let sessionDir = sessionsDir.appendingPathComponent(sessionID, isDirectory: true)
+        let audioDir = sessionDir.appendingPathComponent("audio", isDirectory: true)
+        try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+
+        let metadata = SessionMetadata(
+            id: sessionID,
+            startedAt: Date(timeIntervalSince1970: 10),
+            endedAt: Date(timeIntervalSince1970: 20),
+            templateSnapshot: nil,
+            title: "Batch Audio",
+            utteranceCount: 1,
+            hasNotes: false,
+            language: "en-GB",
+            meetingApp: nil,
+            engine: "parakeetV2",
+            tags: nil,
+            source: nil
+        )
+        let data = try JSONEncoder.iso8601Encoder.encode(metadata)
+        try data.write(to: sessionDir.appendingPathComponent("session.json"), options: .atomic)
+        try Data().write(to: sessionDir.appendingPathComponent("transcript.live.jsonl"), options: .atomic)
+
+        try Data("mic".utf8).write(to: audioDir.appendingPathComponent("mic.caf"), options: .atomic)
+        try Data("sys".utf8).write(to: audioDir.appendingPathComponent("sys.caf"), options: .atomic)
+
+        let batchMeta = BatchMeta(
+            micStartDate: Date(timeIntervalSince1970: 10),
+            sysStartDate: Date(timeIntervalSince1970: 20),
+            micAnchors: [.init(frame: 0, date: Date(timeIntervalSince1970: 10))],
+            sysAnchors: [.init(frame: 0, date: Date(timeIntervalSince1970: 20))],
+            sysEffectiveSampleRate: 24_000
+        )
+        let metaData = try JSONEncoder.iso8601Encoder.encode(batchMeta)
+        try metaData.write(to: audioDir.appendingPathComponent("batch-meta.json"), options: .atomic)
+
+        return sessionDir
+    }
+
+    private func setModificationDate(_ date: Date, forSessionDirectory sessionDir: URL) throws {
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: sessionDir.path)
     }
 
     // MARK: - End session clears state

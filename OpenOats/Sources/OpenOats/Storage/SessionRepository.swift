@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 // MARK: - Supporting Types
 
@@ -53,6 +54,29 @@ struct SessionFinalizeMetadata: Sendable {
     let engine: String?
     let templateSnapshot: TemplateSnapshot?
     let utterances: [Utterance]
+    let calendarEvent: CalendarEvent?
+
+    init(
+        endedAt: Date,
+        utteranceCount: Int,
+        title: String?,
+        language: String?,
+        meetingApp: String?,
+        engine: String?,
+        templateSnapshot: TemplateSnapshot?,
+        utterances: [Utterance],
+        calendarEvent: CalendarEvent? = nil
+    ) {
+        self.endedAt = endedAt
+        self.utteranceCount = utteranceCount
+        self.title = title
+        self.language = language
+        self.meetingApp = meetingApp
+        self.engine = engine
+        self.templateSnapshot = templateSnapshot
+        self.utterances = utterances
+        self.calendarEvent = calendarEvent
+    }
 }
 
 /// Full session detail for loading.
@@ -62,6 +86,23 @@ struct SessionDetail: Sendable {
     let liveTranscript: [SessionRecord]
     let notes: GeneratedNotes?
     let notesMeta: NotesMeta?
+    let calendarEvent: CalendarEvent?
+
+    init(
+        index: SessionIndex,
+        transcript: [SessionRecord],
+        liveTranscript: [SessionRecord],
+        notes: GeneratedNotes?,
+        notesMeta: NotesMeta?,
+        calendarEvent: CalendarEvent? = nil
+    ) {
+        self.index = index
+        self.transcript = transcript
+        self.liveTranscript = liveTranscript
+        self.notes = notes
+        self.notesMeta = notesMeta
+        self.calendarEvent = calendarEvent
+    }
 }
 
 /// Metadata persisted alongside notes.
@@ -85,8 +126,10 @@ struct SessionMetadata: Codable, Sendable {
     var meetingApp: String?
     var engine: String?
     var tags: [String]?
+    var folderPath: String? = nil
     /// How the session was created (nil for live sessions, "imported" for imported audio).
     var source: String?
+    var calendarEvent: CalendarEvent?
 }
 
 // MARK: - SessionRepository
@@ -103,6 +146,9 @@ struct SessionMetadata: Codable, Sendable {
 /// sessions/<id>/audio/
 /// ```
 actor SessionRepository {
+    /// Retain batch stems/metadata long enough to support true reruns and debugging.
+    private static let retainedBatchAudioLifetime: TimeInterval = 7 * 24 * 3600
+
     private let sessionsDirectory: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -150,7 +196,7 @@ actor SessionRepository {
         try? FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
         Self.dropMetadataNeverIndex(in: sessionsDirectory)
 
-        Self.cleanupOrphanedBatchAudio(in: sessionsDirectory)
+        Self.cleanupExpiredRetainedBatchAudio(in: sessionsDirectory)
     }
 
     // MARK: - Configuration
@@ -342,9 +388,12 @@ actor SessionRepository {
             hasNotes: false,
             language: metadata.language,
             meetingApp: metadata.meetingApp,
-            engine: metadata.engine
+            engine: metadata.engine,
+            calendarEvent: metadata.calendarEvent
         )
         writeSessionMetadata(sessionMeta, sessionID: sessionID)
+
+        scheduleMirror(sessionID: sessionID)
     }
 
     /// End a session without full finalization (discard path).
@@ -440,6 +489,26 @@ actor SessionRepository {
             try fm.moveItem(at: tempURL, to: finalURL)
         } catch {
             Log.sessionRepository.error("Failed to write final transcript: \(error, privacy: .public)")
+        }
+
+        if let meta = loadSessionMetadataFile(sessionID: sessionID) {
+            let refreshedMeta = SessionMetadata(
+                id: meta.id,
+                startedAt: records.first?.timestamp ?? meta.startedAt,
+                endedAt: records.last?.timestamp ?? meta.endedAt,
+                templateSnapshot: meta.templateSnapshot,
+                title: meta.title,
+                utteranceCount: records.count,
+                hasNotes: meta.hasNotes,
+                language: meta.language,
+                meetingApp: meta.meetingApp,
+                engine: meta.engine,
+                tags: meta.tags,
+                folderPath: meta.folderPath,
+                source: meta.source,
+                calendarEvent: meta.calendarEvent
+            )
+            writeSessionMetadata(refreshedMeta, sessionID: sessionID)
         }
 
         // Mirror to notesFolderPath
@@ -557,6 +626,7 @@ actor SessionRepository {
                         meetingApp: meta.meetingApp,
                         engine: meta.engine,
                         tags: meta.tags,
+                        folderPath: meta.folderPath,
                         source: meta.source
                     ))
                     continue
@@ -594,6 +664,7 @@ actor SessionRepository {
                 meetingApp: meta.meetingApp,
                 engine: meta.engine,
                 tags: meta.tags,
+                folderPath: meta.folderPath,
                 source: meta.source
             )
 
@@ -606,7 +677,8 @@ actor SessionRepository {
                 transcript: transcript,
                 liveTranscript: liveTranscript,
                 notes: notes,
-                notesMeta: nil
+                notesMeta: nil,
+                calendarEvent: meta.calendarEvent
             )
         }
 
@@ -669,11 +741,13 @@ actor SessionRepository {
     }
 
     func updateSessionTags(sessionID: String, tags: [String]) {
-        let normalized = Self.normalizeTags(tags)
+        let normalizedVisibleTags = Self.normalizeUserVisibleTags(tags)
 
         // Try canonical first
         if var meta = loadSessionMetadataFile(sessionID: sessionID) {
-            meta.tags = normalized.isEmpty ? nil : normalized
+            let preservedInternalTags = Self.internalSessionTags(from: meta.tags ?? [])
+            let combinedTags = preservedInternalTags + normalizedVisibleTags
+            meta.tags = combinedTags.isEmpty ? nil : combinedTags
             writeSessionMetadata(meta, sessionID: sessionID)
             return
         }
@@ -691,19 +765,125 @@ actor SessionRepository {
             language: index.language,
             meetingApp: index.meetingApp,
             engine: index.engine,
-            tags: normalized.isEmpty ? nil : normalized
+            tags: normalizedVisibleTags.isEmpty ? nil : normalizedVisibleTags,
+            folderPath: index.folderPath,
+            source: index.source
         )
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         writeSessionMetadata(meta, sessionID: sessionID)
     }
 
+    func updateSessionFolder(sessionID: String, folderPath: String?) {
+        let normalizedFolderPath = Self.normalizeSessionFolderPath(folderPath)
+
+        if var meta = loadSessionMetadataFile(sessionID: sessionID) {
+            meta.folderPath = normalizedFolderPath
+            writeSessionMetadata(meta, sessionID: sessionID)
+            return
+        }
+
+        let index = LegacySessionReader.loadIndex(sessionID: sessionID, sessionsDirectory: sessionsDirectory)
+        let meta = SessionMetadata(
+            id: index.id,
+            startedAt: index.startedAt,
+            endedAt: index.endedAt,
+            templateSnapshot: index.templateSnapshot,
+            title: index.title,
+            utteranceCount: index.utteranceCount,
+            hasNotes: index.hasNotes,
+            language: index.language,
+            meetingApp: index.meetingApp,
+            engine: index.engine,
+            tags: index.tags,
+            folderPath: normalizedFolderPath,
+            source: index.source
+        )
+        let dir = sessionDirectory(for: sessionID)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        writeSessionMetadata(meta, sessionID: sessionID)
+    }
+
+    func updateSessionCalendarEvent(sessionID: String, calendarEvent: CalendarEvent?) {
+        if var meta = loadSessionMetadataFile(sessionID: sessionID) {
+            meta.calendarEvent = calendarEvent
+            writeSessionMetadata(meta, sessionID: sessionID)
+            scheduleMirror(sessionID: sessionID)
+            return
+        }
+
+        let index = LegacySessionReader.loadIndex(sessionID: sessionID, sessionsDirectory: sessionsDirectory)
+        let meta = SessionMetadata(
+            id: index.id,
+            startedAt: index.startedAt,
+            endedAt: index.endedAt,
+            templateSnapshot: index.templateSnapshot,
+            title: index.title,
+            utteranceCount: index.utteranceCount,
+            hasNotes: index.hasNotes,
+            language: index.language,
+            meetingApp: index.meetingApp,
+            engine: index.engine,
+            tags: index.tags,
+            folderPath: index.folderPath,
+            source: index.source,
+            calendarEvent: calendarEvent
+        )
+        let dir = sessionDirectory(for: sessionID)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        writeSessionMetadata(meta, sessionID: sessionID)
+        scheduleMirror(sessionID: sessionID)
+    }
+
+    func reconcileGhostSession(
+        sessionID: String,
+        maximumGap: TimeInterval = 5 * 60
+    ) -> String? {
+        guard let ghostMeta = loadSessionMetadataFile(sessionID: sessionID),
+              ghostMeta.utteranceCount == 0,
+              ghostMeta.hasNotes == false,
+              let calendarEvent = ghostMeta.calendarEvent,
+              !sessionHasMeaningfulArtifacts(sessionID: sessionID) else { return nil }
+
+        let historyKey = MeetingHistoryResolver.historyKey(for: ghostMeta.title ?? calendarEvent.title)
+        guard !historyKey.isEmpty else { return nil }
+
+        let candidates = listSessions()
+            .filter { candidate in
+                guard candidate.id != sessionID else { return false }
+                guard candidate.utteranceCount > 0 else { return false }
+                guard MeetingHistoryResolver.historyKey(for: candidate.title ?? "") == historyKey else {
+                    return false
+                }
+                let referenceDate = candidate.endedAt ?? candidate.startedAt
+                let gap = ghostMeta.startedAt.timeIntervalSince(referenceDate)
+                return gap >= 0 && gap <= maximumGap
+            }
+            .sorted {
+                let lhsGap = ghostMeta.startedAt.timeIntervalSince($0.endedAt ?? $0.startedAt)
+                let rhsGap = ghostMeta.startedAt.timeIntervalSince($1.endedAt ?? $1.startedAt)
+                return lhsGap < rhsGap
+            }
+
+        guard let target = candidates.first else { return nil }
+
+        if let targetMeta = loadSessionMetadataFile(sessionID: target.id),
+           targetMeta.calendarEvent == nil {
+            updateSessionCalendarEvent(sessionID: target.id, calendarEvent: calendarEvent)
+        }
+
+        deleteSession(sessionID: sessionID)
+        return target.id
+    }
+
     /// Update source and tags for an imported session.
     func updateSessionSource(sessionID: String, source: String, tags: [String]) {
         guard var meta = loadSessionMetadataFile(sessionID: sessionID) else { return }
         meta.source = source
-        let existing = meta.tags ?? []
-        meta.tags = Self.normalizeTags(existing + tags)
+        let existingVisibleTags = Self.userVisibleSessionTags(from: meta.tags ?? [])
+        let preservedInternalTags = Self.normalizeInternalSessionTags((meta.tags ?? []) + tags)
+        let combinedTags = preservedInternalTags + Self.normalizeUserVisibleTags(existingVisibleTags)
+        meta.tags = combinedTags.isEmpty ? nil : combinedTags
         writeSessionMetadata(meta, sessionID: sessionID)
     }
 
@@ -738,6 +918,52 @@ actor SessionRepository {
             if result.count >= 5 { break }
         }
         return result
+    }
+
+    private static func normalizeUserVisibleTags(_ tags: [String]) -> [String] {
+        normalizeTags(userVisibleSessionTags(from: tags))
+    }
+
+    private static func normalizeInternalSessionTags(_ tags: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for tag in internalSessionTags(from: tags) {
+            let key = tag.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            result.append(tag)
+        }
+        return result
+    }
+
+    private static func userVisibleSessionTags(from tags: [String]) -> [String] {
+        tags.filter { !isInternalSessionTag($0) }
+    }
+
+    private static func internalSessionTags(from tags: [String]) -> [String] {
+        tags.filter(isInternalSessionTag)
+    }
+
+    private static func normalizeSessionFolderPath(_ folderPath: String?) -> String? {
+        NotesFolderDefinition.normalizePath(folderPath ?? "")
+    }
+
+    private func sessionHasMeaningfulArtifacts(sessionID: String) -> Bool {
+        if !loadTranscript(sessionID: sessionID).isEmpty { return true }
+        if !loadLiveTranscript(sessionID: sessionID).isEmpty { return true }
+
+        let audioDir = sessionDirectory(for: sessionID).appendingPathComponent("audio", isDirectory: true)
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: audioDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        return !contents.isEmpty
+    }
+
+    private static func isInternalSessionTag(_ tag: String) -> Bool {
+        tag.lowercased().hasPrefix("granola:")
     }
 
     func deleteSession(sessionID: String) {
@@ -838,7 +1064,8 @@ actor SessionRepository {
             micStartDate: anchors.micStartDate,
             sysStartDate: anchors.sysStartDate,
             micAnchors: anchors.micAnchors.map { .init(frame: $0.frame, date: $0.date) },
-            sysAnchors: anchors.sysAnchors.map { .init(frame: $0.frame, date: $0.date) }
+            sysAnchors: anchors.sysAnchors.map { .init(frame: $0.frame, date: $0.date) },
+            sysEffectiveSampleRate: anchors.sysEffectiveSampleRate
         )
         if let data = try? JSONEncoder.iso8601Encoder.encode(meta) {
             try? data.write(to: audioDir.appendingPathComponent("batch-meta.json"), options: .atomic)
@@ -982,23 +1209,162 @@ actor SessionRepository {
 
     func getCurrentSessionID() -> String? { currentSessionID }
 
-    /// Returns the URL of the playable audio file for a session, if one exists.
-    /// Checks for merged M4A exports and imported audio files.
+    /// Returns the default playable audio source URL for a session, if one exists.
     func audioFileURL(for sessionID: String) -> URL? {
-        let audioDir = sessionDirectory(for: sessionID)
-            .appendingPathComponent("audio", isDirectory: true)
+        audioSources(for: sessionID).first?.url
+    }
+
+    func audioSources(for sessionID: String) -> [SessionAudioSource] {
+        SessionRepository.readAudioSources(dir: sessionDirectory(for: sessionID))
+    }
+
+    // MARK: - Concurrent Session Loading
+
+    /// Loads notes, transcript, audio sources, and persisted calendar context concurrently off the actor.
+    /// Prefer this over separate awaited calls to avoid sequential actor hops.
+    nonisolated func loadSessionData(
+        sessionID: String
+    ) async -> (
+        notes: GeneratedNotes?,
+        transcript: [SessionRecord],
+        audioURL: URL?,
+        audioSources: [SessionAudioSource],
+        calendarEvent: CalendarEvent?
+    ) {
+        let sessDir = sessionsDirectoryURL
+        let dir = sessDir.appendingPathComponent(sessionID, isDirectory: true)
+
+        async let notes = Task.detached(priority: .userInitiated) {
+            SessionRepository.readNotes(sessionID: sessionID, dir: dir, sessionsDirectory: sessDir)
+        }.value
+        async let transcript = Task.detached(priority: .userInitiated) {
+            SessionRepository.readTranscript(sessionID: sessionID, dir: dir, sessionsDirectory: sessDir)
+        }.value
+        async let audioSources = Task.detached(priority: .userInitiated) {
+            SessionRepository.readAudioSources(dir: dir)
+        }.value
+        async let calendarEvent = Task.detached(priority: .userInitiated) {
+            SessionRepository.readCalendarEvent(dir: dir)
+        }.value
+
+        let resolvedAudioSources = await audioSources
+        return await (notes, transcript, resolvedAudioSources.first?.url, resolvedAudioSources, calendarEvent)
+    }
+
+    private nonisolated static func readNotes(sessionID: String, dir: URL, sessionsDirectory: URL) -> GeneratedNotes? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let mdURL = dir.appendingPathComponent("notes.md")
+        let metaURL = dir.appendingPathComponent("notes.meta.json")
+
+        if let markdown = try? String(contentsOf: mdURL, encoding: .utf8),
+           let metaData = try? Data(contentsOf: metaURL),
+           let meta = try? decoder.decode(NotesMeta.self, from: metaData) {
+            return GeneratedNotes(template: meta.templateSnapshot, generatedAt: meta.generatedAt, markdown: markdown)
+        }
+
+        return LegacySessionReader.loadNotes(sessionID: sessionID, sessionsDirectory: sessionsDirectory)
+    }
+
+    private nonisolated static func readCalendarEvent(dir: URL) -> CalendarEvent? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let metaURL = dir.appendingPathComponent("session.json")
+        guard let data = try? Data(contentsOf: metaURL),
+              let meta = try? decoder.decode(SessionMetadata.self, from: data) else {
+            return nil
+        }
+        return meta.calendarEvent
+    }
+
+    private nonisolated static func readTranscript(sessionID: String, dir: URL, sessionsDirectory: URL) -> [SessionRecord] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        func parse(_ content: String) -> [SessionRecord] {
+            content.components(separatedBy: "\n").filter { !$0.isEmpty }.compactMap { line in
+                guard let data = line.data(using: .utf8) else { return nil }
+                return try? decoder.decode(SessionRecord.self, from: data)
+            }
+        }
+
+        let finalURL = dir.appendingPathComponent("transcript.final.jsonl")
+        if FileManager.default.fileExists(atPath: finalURL.path),
+           let content = try? String(contentsOf: finalURL, encoding: .utf8) {
+            let records = parse(content)
+            if !records.isEmpty { return records }
+        }
+
+        let liveURL = dir.appendingPathComponent("transcript.live.jsonl")
+        if FileManager.default.fileExists(atPath: liveURL.path),
+           let content = try? String(contentsOf: liveURL, encoding: .utf8) {
+            let records = parse(content)
+            if !records.isEmpty { return records }
+        }
+
+        return LegacySessionReader.loadTranscript(sessionID: sessionID, sessionsDirectory: sessionsDirectory)
+    }
+
+    private nonisolated static func readAudioSources(dir: URL) -> [SessionAudioSource] {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: audioDir.path) else { return nil }
+        let audioDir = dir.appendingPathComponent("audio", isDirectory: true)
+        var sources: [SessionAudioSource] = []
 
-        guard let contents = try? fm.contentsOfDirectory(
-            at: audioDir,
-            includingPropertiesForKeys: nil
-        ) else { return nil }
+        if let url = readPrimaryPlayableAudioURL(in: audioDir) ?? readPrimaryPlayableAudioURL(in: dir) {
+            sources.append(SessionAudioSource(kind: .recording, url: url))
+        }
 
-        // Prefer M4A exports, then imported files — skip raw CAF and batch metadata
+        let canonicalSystemURL = audioDir.appendingPathComponent("sys.caf")
+        let legacySystemURL = dir.appendingPathComponent("sys.caf")
+        if fm.fileExists(atPath: canonicalSystemURL.path) {
+            sources.append(SessionAudioSource(kind: .system, url: canonicalSystemURL))
+        } else if fm.fileExists(atPath: legacySystemURL.path) {
+            sources.append(SessionAudioSource(kind: .system, url: legacySystemURL))
+        }
+
+        let canonicalMicURL = audioDir.appendingPathComponent("mic.caf")
+        let legacyMicURL = dir.appendingPathComponent("mic.caf")
+        if fm.fileExists(atPath: canonicalMicURL.path) {
+            sources.append(SessionAudioSource(kind: .microphone, url: canonicalMicURL))
+        } else if fm.fileExists(atPath: legacyMicURL.path) {
+            sources.append(SessionAudioSource(kind: .microphone, url: legacyMicURL))
+        }
+
+        return sources
+    }
+
+    private nonisolated static func readPrimaryPlayableAudioURL(in dir: URL) -> URL? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: dir.path),
+              let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return nil }
         let skipExtensions: Set<String> = ["caf", "json"]
-        let playable = contents.filter { !skipExtensions.contains($0.pathExtension.lowercased()) }
-        return playable.first
+        let skipFilenames: Set<String> = [
+            "session.json",
+            "transcript.live.jsonl",
+            "transcript.final.jsonl",
+            "notes.md",
+            "notes.meta.json",
+            "batch-meta.json",
+            "mic.caf",
+            "sys.caf",
+        ]
+        return contents
+            .filter {
+                var isDirectory: ObjCBool = false
+                guard fm.fileExists(atPath: $0.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+                    return false
+                }
+                guard !skipFilenames.contains($0.lastPathComponent.lowercased()) else {
+                    return false
+                }
+                let pathExtension = $0.pathExtension.lowercased()
+                guard !skipExtensions.contains(pathExtension) else { return false }
+                guard let contentType = UTType(filenameExtension: pathExtension) else { return false }
+                return contentType.conforms(to: .audio)
+            }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+            .first
     }
 
     // MARK: - Concurrent Session Loading
@@ -1232,6 +1598,7 @@ actor SessionRepository {
             meetingApp: meta?.meetingApp,
             engine: meta?.engine,
             tags: meta?.tags,
+            folderPath: meta?.folderPath,
             source: meta?.source
         )
 
@@ -1254,14 +1621,14 @@ actor SessionRepository {
 
     // MARK: - Orphan Cleanup
 
-    private static func cleanupOrphanedBatchAudio(in sessionsDirectory: URL) {
+    private static func cleanupExpiredRetainedBatchAudio(in sessionsDirectory: URL) {
         let fm = FileManager.default
         guard let contents = try? fm.contentsOfDirectory(
             at: sessionsDirectory,
             includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey]
         ) else { return }
 
-        let cutoff = Date().addingTimeInterval(-24 * 3600)
+        let cutoff = Date().addingTimeInterval(-retainedBatchAudioLifetime)
 
         for item in contents {
             guard let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
@@ -1291,7 +1658,7 @@ actor SessionRepository {
                 try? fm.removeItem(at: micLegacy)
                 try? fm.removeItem(at: sysLegacy)
                 try? fm.removeItem(at: item.appendingPathComponent("batch-meta.json"))
-                Log.sessionRepository.info("Cleaned up orphaned batch audio in \(name, privacy: .public)")
+                Log.sessionRepository.info("Cleaned up expired retained batch audio in \(name, privacy: .public)")
             }
         }
     }
@@ -1305,6 +1672,7 @@ struct BatchAnchors: Sendable {
     let sysStartDate: Date?
     let micAnchors: [(frame: Int64, date: Date)]
     let sysAnchors: [(frame: Int64, date: Date)]
+    let sysEffectiveSampleRate: Double?
 }
 
 /// Codable batch metadata persisted as batch-meta.json.
@@ -1313,6 +1681,7 @@ struct BatchMeta: Codable, Sendable {
     let sysStartDate: Date?
     let micAnchors: [TimingAnchor]
     let sysAnchors: [TimingAnchor]
+    let sysEffectiveSampleRate: Double?
 
     struct TimingAnchor: Codable, Sendable {
         let frame: Int64

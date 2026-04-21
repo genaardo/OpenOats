@@ -5,6 +5,7 @@ struct MenuBarPopoverView: View {
     let settings: AppSettings
     let onShowMainWindow: () -> Void
     let onCheckForUpdates: () -> Void
+    let onShowSettings: () -> Void
     let onQuit: () -> Void
 
     @State private var elapsedSeconds: Int = 0
@@ -52,9 +53,7 @@ struct MenuBarPopoverView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
 
-            Button(action: {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            }) {
+            Button(action: onShowSettings) {
                 HStack {
                     Text("Settings…")
                     Spacer()
@@ -133,8 +132,7 @@ struct MenuBarPopoverView: View {
                     .font(.system(size: 13, weight: .medium))
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
+            .buttonStyle(OpenOatsProminentButtonStyle(color: .red))
             .controlSize(.regular)
         } else {
             Button(action: {
@@ -148,7 +146,7 @@ struct MenuBarPopoverView: View {
                     .font(.system(size: 13, weight: .medium))
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(OpenOatsProminentButtonStyle())
             .controlSize(.regular)
         }
     }

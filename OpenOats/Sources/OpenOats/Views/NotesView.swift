@@ -1,12 +1,21 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct NotesView: View {
     @Bindable var settings: AppSettings
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.openWindow) private var openWindow
     @State private var notesController: NotesController?
     @State private var renamingSessionID: String?
     @State private var renameText: String = ""
+    @FocusState private var renameFieldFocused: Bool
+    @State private var creatingFolderForSessionID: String?
+    @State private var creatingFolderForMeetingFamilyKey: String?
+    @State private var pendingMeetingFamilyFolderChange: PendingMeetingFamilyFolderChange?
+    @State private var newFolderPath: String = ""
+    @State private var newFolderColor: NotesFolderColor = .orange
+    @FocusState private var newFolderFieldFocused: Bool
     @State private var sessionToDelete: String?
     @State private var showDeleteConfirmation = false
     @State private var bulkDeleteMode = false
@@ -26,9 +35,23 @@ struct NotesView: View {
         case idle, syncing, success, failed
     }
 
+    enum MeetingFamilyBottomTab: String, CaseIterable {
+        case history = "Previous meetings"
+        case link = "Link meetings"
+    }
+
     @State private var detailViewMode: DetailViewMode = .transcript
     @State private var appleNotesSyncState: AppleNotesSyncState = .idle
     @State private var appleNotesLastSyncDate: Date? = nil
+    @State private var meetingFamilyBottomTab: MeetingFamilyBottomTab = .history
+    @State private var isMeetingFamilyBottomCollapsed = false
+
+    private struct PendingMeetingFamilyFolderChange: Equatable {
+        let historyKey: String
+        let familyTitle: String
+        let folderPath: String?
+        let existingMeetingCount: Int
+    }
 
     var body: some View {
         Group {
@@ -39,7 +62,7 @@ struct NotesView: View {
             }
         }
         .task {
-            let controller = NotesController(coordinator: coordinator)
+            let controller = NotesController(coordinator: coordinator, settings: settings)
             notesController = controller
             await controller.loadHistory()
 
@@ -47,10 +70,19 @@ struct NotesView: View {
             // to ensure @State detailViewMode update happens in the same
             // transaction as session selection (matches pre-Phase 6 behavior).
             if let requested = coordinator.consumeRequestedSessionSelection() {
-                controller.selectSession(requested)
-                // Show Transcript tab for imported sessions (no notes generated yet)
-                let isImported = controller.state.sessionHistory.first(where: { $0.id == requested })?.source == "imported"
-                detailViewMode = isImported ? .transcript : .notes
+                switch requested {
+                case .session(let sessionID):
+                    controller.selectSession(sessionID)
+                    // Show Transcript tab for imported sessions (no notes generated yet)
+                    let isImported = controller.state.sessionHistory.first(where: { $0.id == sessionID })?.source == "imported"
+                    detailViewMode = isImported ? .transcript : .notes
+                case .meetingHistory(let event):
+                    controller.showMeetingFamily(for: event)
+                    detailViewMode = .notes
+                case .clearSelection:
+                    controller.selectSession(nil)
+                    detailViewMode = .notes
+                }
             } else if let last = coordinator.lastEndedSession {
                 controller.selectSession(last.id)
             }
@@ -73,7 +105,7 @@ struct NotesView: View {
         .onChange(of: coordinator.sessionHistory.count) {
             Task { await controller.loadHistory() }
         }
-        .onChange(of: coordinator.requestedSessionSelectionID) {
+        .onChange(of: coordinator.requestedNotesNavigation?.id) {
             if controller.handleRequestedSessionSelection() {
                 detailViewMode = .notes
             }
@@ -82,6 +114,62 @@ struct NotesView: View {
             appleNotesSyncState = .idle
             appleNotesLastSyncDate = controller.state.selectedSessionID
                 .flatMap { AppleNotesService.lastSyncDate(for: $0) }
+        }
+        .onChange(of: state.selectedMeetingFamily?.key) {
+            meetingFamilyBottomTab = .history
+            isMeetingFamilyBottomCollapsed = false
+            pendingMeetingFamilyFolderChange = nil
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { renamingSessionID != nil },
+                set: { if !$0 { cancelRename() } }
+            )
+        ) {
+            if let sessionID = renamingSessionID {
+                renameSessionSheet(controller: controller, sessionID: sessionID)
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { creatingFolderForSessionID != nil },
+                set: { if !$0 { cancelCreateFolder() } }
+            )
+        ) {
+            if let sessionID = creatingFolderForSessionID {
+                newFolderSheet(controller: controller, sessionID: sessionID)
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { creatingFolderForMeetingFamilyKey != nil },
+                set: { if !$0 { cancelCreateFolder() } }
+            )
+        ) {
+            meetingFamilyFolderSheetContent(controller: controller)
+        }
+        .confirmationDialog(
+            "Update default folder?",
+            isPresented: Binding(
+                get: { pendingMeetingFamilyFolderChange != nil },
+                set: { if !$0 { pendingMeetingFamilyFolderChange = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingMeetingFamilyFolderChange
+        ) { pendingChange in
+                Button("Future meetings only") {
+                    applyPendingMeetingFamilyFolderChange(controller: controller, moveExistingSessions: false)
+                }
+
+                Button(moveExistingMeetingsTitle(for: pendingChange)) {
+                    applyPendingMeetingFamilyFolderChange(controller: controller, moveExistingSessions: true)
+                }
+
+                Button("Cancel", role: .cancel) {
+                    pendingMeetingFamilyFolderChange = nil
+                }
+        } message: { pendingChange in
+            Text(meetingFamilyFolderChangeMessage(for: pendingChange))
         }
     }
 
@@ -124,8 +212,39 @@ struct NotesView: View {
             }
 
             if bulkDeleteMode {
-                List(controller.filteredSessions, selection: $bulkDeleteSelection) { session in
-                    sessionRow(controller: controller, session: session)
+                List(selection: $bulkDeleteSelection) {
+                    if controller.showsFolderSections {
+                        if !controller.rootFolderSessions.isEmpty {
+                            Section {
+                                ForEach(controller.rootFolderSessions) { session in
+                                    sessionRow(controller: controller, session: session)
+                                }
+                            } header: {
+                                rootFolderSectionHeader()
+                            }
+                        }
+                        ForEach(controller.folderGroups) { group in
+                            Section {
+                                ForEach(group.sessions) { session in
+                                    sessionRow(controller: controller, session: session)
+                                }
+                            } header: {
+                                folderSectionHeader(group)
+                            }
+                        }
+                    } else if controller.showsSourceSections {
+                        ForEach(controller.sessionSourceGroups) { group in
+                            Section(group.title) {
+                                ForEach(group.sessions) { session in
+                                    sessionRow(controller: controller, session: session)
+                                }
+                            }
+                        }
+                    } else {
+                        ForEach(controller.filteredSessions) { session in
+                            sessionRow(controller: controller, session: session)
+                        }
+                    }
                 }
                 .listStyle(.sidebar)
             } else {
@@ -133,38 +252,39 @@ struct NotesView: View {
                     get: { state.selectedSessionID },
                     set: { controller.selectSession($0) }
                 )
-                List(controller.filteredSessions, selection: selectedBinding) { session in
-                    sessionRow(controller: controller, session: session)
-                        .contextMenu {
-                            Button("Rename...") {
-                                renameText = session.title ?? ""
-                                renamingSessionID = session.id
+                List(selection: selectedBinding) {
+                    if controller.showsFolderSections {
+                        if !controller.rootFolderSessions.isEmpty {
+                            Section {
+                                ForEach(controller.rootFolderSessions) { session in
+                                    sessionListEntry(controller: controller, session: session)
+                                }
+                            } header: {
+                                rootFolderSectionHeader()
                             }
-                            Button("Edit Tags...") {
-                                editingTags = session.tags ?? []
-                                newTagText = ""
-                                editingTagsSessionID = session.id
-                                Task {
-                                    availableTags = await controller.allTags()
+                        }
+                        ForEach(controller.folderGroups) { group in
+                            Section {
+                                ForEach(group.sessions) { session in
+                                    sessionListEntry(controller: controller, session: session)
+                                }
+                            } header: {
+                                folderSectionHeader(group)
+                            }
+                        }
+                    } else if controller.showsSourceSections {
+                        ForEach(controller.sessionSourceGroups) { group in
+                            Section(group.title) {
+                                ForEach(group.sessions) { session in
+                                    sessionListEntry(controller: controller, session: session)
                                 }
                             }
-                            Divider()
-                            Button("Select Multiple...") {
-                                bulkDeleteMode = true
-                                bulkDeleteSelection = [session.id]
-                            }
-                            Divider()
-                            Button("Delete", role: .destructive) {
-                                sessionToDelete = session.id
-                                showDeleteConfirmation = true
-                            }
                         }
-                        .popover(isPresented: Binding(
-                            get: { editingTagsSessionID == session.id },
-                            set: { if !$0 { editingTagsSessionID = nil } }
-                        )) {
-                            tagEditorPopover(controller: controller, sessionID: session.id)
+                    } else {
+                        ForEach(controller.filteredSessions) { session in
+                            sessionListEntry(controller: controller, session: session)
                         }
+                    }
                 }
                 .listStyle(.sidebar)
             }
@@ -193,7 +313,50 @@ struct NotesView: View {
     }
 
     @ViewBuilder
+    private func sessionListEntry(controller: NotesController, session: SessionIndex) -> some View {
+        sessionRow(controller: controller, session: session)
+            .contextMenu {
+                sessionContextMenu(controller: controller, session: session)
+            }
+            .popover(isPresented: Binding(
+                get: { editingTagsSessionID == session.id },
+                set: { if !$0 { editingTagsSessionID = nil } }
+            )) {
+                tagEditorPopover(controller: controller, sessionID: session.id)
+            }
+    }
+
+    @ViewBuilder
+    private func sessionContextMenu(controller: NotesController, session: SessionIndex) -> some View {
+        Button("Rename...") {
+            beginRenaming(session)
+        }
+        Menu("Move to Folder") {
+            folderAssignmentMenu(controller: controller, session: session)
+        }
+        Button("Edit Tags...") {
+            editingTags = NotesController.visibleTags(for: session)
+            newTagText = ""
+            editingTagsSessionID = session.id
+            Task {
+                availableTags = await controller.allTags()
+            }
+        }
+        Divider()
+        Button("Select Multiple...") {
+            bulkDeleteMode = true
+            bulkDeleteSelection = [session.id]
+        }
+        Divider()
+        Button("Delete", role: .destructive) {
+            sessionToDelete = session.id
+            showDeleteConfirmation = true
+        }
+    }
+
+    @ViewBuilder
     private func sessionRow(controller: NotesController, session: SessionIndex) -> some View {
+        let visibleTags = NotesController.visibleTags(for: session)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 if let snap = session.templateSnapshot {
@@ -201,21 +364,10 @@ struct NotesView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
-                if renamingSessionID == session.id {
-                    TextField("Title", text: $renameText, onCommit: {
-                        controller.renameSession(sessionID: session.id, newTitle: renameText)
-                        renamingSessionID = nil
-                    })
+                Text(sessionTitle(for: session))
                     .font(.system(size: 13, weight: .medium))
-                    .textFieldStyle(.plain)
-                    .onExitCommand {
-                        renamingSessionID = nil
-                    }
-                } else {
-                    Text(session.title ?? "Untitled")
-                        .font(.system(size: 13, weight: .medium))
-                        .lineLimit(1)
-                }
+                    .lineLimit(1)
+                    .accessibilityIdentifier("notes.sessionTitle.\(session.id)")
                 Spacer()
                 if controller.isGenerating(sessionID: session.id) {
                     ProgressView().controlSize(.mini).scaleEffect(0.7)
@@ -228,6 +380,18 @@ struct NotesView: View {
                                 : Color.secondary
                         )
                 }
+                Menu {
+                    folderAssignmentMenu(controller: controller, session: session)
+                } label: {
+                    Image(systemName: session.folderPath == nil ? "folder" : "folder.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(folderColor(for: session.folderPath))
+                        .frame(width: 18, height: 18)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .buttonStyle(.plain)
+                .help(session.folderPath.map { "Folder: \($0)" } ?? "Assign folder")
             }
 
             HStack(spacing: 6) {
@@ -239,9 +403,9 @@ struct NotesView: View {
             .font(.system(size: 11))
             .foregroundStyle(.tertiary)
 
-            if let tags = session.tags, !tags.isEmpty {
+            if !visibleTags.isEmpty {
                 HStack(spacing: 4) {
-                    ForEach(tags, id: \.self) { tag in
+                    ForEach(visibleTags, id: \.self) { tag in
                         Text(tag)
                             .font(.system(size: 10))
                             .padding(.horizontal, 5)
@@ -255,6 +419,328 @@ struct NotesView: View {
         }
         .padding(.vertical, 2)
         .accessibilityIdentifier("notes.session.\(session.id)")
+    }
+
+    @ViewBuilder
+    private func renameSessionSheet(controller: NotesController, sessionID: String) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename Meeting")
+                .font(.headline)
+
+            TextField(renamePlaceholder(for: sessionID, controller: controller), text: $renameText)
+                .textFieldStyle(.roundedBorder)
+                .focused($renameFieldFocused)
+                .accessibilityIdentifier("notes.renameSheet.field")
+                .onAppear {
+                    renameFieldFocused = true
+                }
+                .onSubmit {
+                    commitRename(controller: controller, sessionID: sessionID)
+                }
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    cancelRename()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Rename") {
+                    commitRename(controller: controller, sessionID: sessionID)
+                }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("notes.renameSheet.saveButton")
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+        .accessibilityIdentifier("notes.renameSheet")
+    }
+
+    private func beginRenaming(_ session: SessionIndex) {
+        renameText = session.title ?? ""
+        renamingSessionID = session.id
+    }
+
+    private func commitRename(controller: NotesController, sessionID: String) {
+        let trimmedTitle = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        controller.renameSession(sessionID: sessionID, newTitle: trimmedTitle)
+        cancelRename()
+    }
+
+    private func cancelRename() {
+        renamingSessionID = nil
+        renameFieldFocused = false
+        renameText = ""
+    }
+
+    @ViewBuilder
+    private func newFolderSheet(controller: NotesController, sessionID: String) -> some View {
+        folderEditorSheet(
+            title: "New Folder",
+            subtitle: "Use `/` to create subfolders inside your Notes list.",
+            saveDisabled: NotesFolderDefinition.normalizePath(newFolderPath) == nil,
+            onSave: {
+                commitCreateFolder(controller: controller, sessionID: sessionID)
+            }
+        )
+        .accessibilityIdentifier("notes.newFolderSheet")
+    }
+
+    @ViewBuilder
+    private func meetingFamilyFolderSheet(
+        controller: NotesController,
+        selection: MeetingFamilySelection,
+        historyCount: Int
+    ) -> some View {
+        folderEditorSheet(
+            title: "New Default Folder",
+            subtitle: "Use a top-level folder and at most one subfolder, like `Work` or `Work/1:1s`.",
+            saveDisabled: normalizedMeetingFamilyFolderPath(newFolderPath) == nil,
+            onSave: {
+                commitCreateFolder(
+                    controller: controller,
+                    selection: selection,
+                    historyCount: historyCount
+                )
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func meetingFamilyFolderSheetContent(controller: NotesController) -> some View {
+        if let meetingFamilyKey = creatingFolderForMeetingFamilyKey {
+            let selection = controller.state.selectedMeetingFamily
+            if let selection, selection.key == meetingFamilyKey {
+                meetingFamilyFolderSheet(
+                    controller: controller,
+                    selection: selection,
+                    historyCount: controller.state.meetingHistoryEntries.count
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func folderEditorSheet(
+        title: String,
+        subtitle: String,
+        saveDisabled: Bool,
+        onSave: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title)
+                .font(.headline)
+
+            Text(subtitle)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            TextField("e.g. Work/1:1s", text: $newFolderPath)
+                .textFieldStyle(.roundedBorder)
+                .focused($newFolderFieldFocused)
+                .accessibilityIdentifier("notes.newFolderSheet.field")
+                .onAppear {
+                    newFolderFieldFocused = true
+                }
+                .onSubmit {
+                    onSave()
+                }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Color")
+                    .font(.system(size: 12, weight: .medium))
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(28), spacing: 8), count: 4), spacing: 8) {
+                    ForEach(NotesFolderColor.allCases) { color in
+                        Button {
+                            newFolderColor = color
+                        } label: {
+                            ZStack {
+                                Circle()
+                                    .fill(folderColor(for: color))
+                                    .frame(width: 18, height: 18)
+                                if newFolderColor == color {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .frame(width: 28, height: 28)
+                            .background(
+                                Circle()
+                                    .stroke(
+                                        newFolderColor == color ? Color.primary.opacity(0.35) : Color.secondary.opacity(0.15),
+                                        lineWidth: 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help(color.displayName)
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+
+                Button("Cancel") {
+                    cancelCreateFolder()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Create") {
+                    onSave()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(saveDisabled)
+                .accessibilityIdentifier("notes.newFolderSheet.saveButton")
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+    }
+
+    @ViewBuilder
+    private func folderAssignmentMenu(controller: NotesController, session: SessionIndex) -> some View {
+        Button {
+            controller.updateSessionFolder(sessionID: session.id, folderPath: nil)
+        } label: {
+            HStack {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+                Text("My notes")
+                if session.folderPath == nil {
+                    Spacer()
+                    Image(systemName: "checkmark")
+                }
+            }
+        }
+
+        if !settings.notesFolders.isEmpty {
+            Divider()
+            ForEach(settings.notesFolders) { folder in
+                Button {
+                    controller.updateSessionFolder(sessionID: session.id, folderPath: folder.path)
+                } label: {
+                    HStack {
+                        Image(systemName: "folder.fill")
+                            .foregroundStyle(folderColor(for: folder.color))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(folder.displayName)
+                            if let breadcrumb = folder.breadcrumb {
+                                Text(breadcrumb)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if session.folderPath == folder.path {
+                            Spacer()
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        }
+
+        Divider()
+
+        Button {
+            beginCreateFolder(for: session)
+        } label: {
+            HStack {
+                Image(systemName: "folder.badge.plus")
+                Text("New Folder…")
+            }
+        }
+    }
+
+    private func beginCreateFolder(for session: SessionIndex) {
+        newFolderPath = session.folderPath ?? ""
+        newFolderColor = folderDefinition(for: session.folderPath)?.color ?? .orange
+        creatingFolderForSessionID = session.id
+    }
+
+    private func beginCreateFolder(for selection: MeetingFamilySelection) {
+        let preferredFolderPath = settings.meetingFamilyPreferences(forHistoryKey: selection.key)?.folderPath
+        newFolderPath = preferredFolderPath ?? ""
+        newFolderColor = folderDefinition(for: preferredFolderPath)?.color ?? .orange
+        creatingFolderForMeetingFamilyKey = selection.key
+    }
+
+    private func commitCreateFolder(controller: NotesController, sessionID: String) {
+        guard let normalizedPath = NotesFolderDefinition.normalizePath(newFolderPath) else { return }
+        var folders = settings.notesFolders
+        if let existingIndex = folders.firstIndex(where: { $0.path.caseInsensitiveCompare(normalizedPath) == .orderedSame }) {
+            folders[existingIndex].color = newFolderColor
+        } else {
+            folders.append(NotesFolderDefinition(path: normalizedPath, color: newFolderColor))
+        }
+        settings.notesFolders = folders
+        controller.updateSessionFolder(sessionID: sessionID, folderPath: normalizedPath)
+        cancelCreateFolder()
+    }
+
+    private func commitCreateFolder(
+        controller: NotesController,
+        selection: MeetingFamilySelection,
+        historyCount: Int
+    ) {
+        guard let normalizedPath = normalizedMeetingFamilyFolderPath(newFolderPath) else { return }
+        var folders = settings.notesFolders
+        if let existingIndex = folders.firstIndex(where: { $0.path.caseInsensitiveCompare(normalizedPath) == .orderedSame }) {
+            folders[existingIndex].color = newFolderColor
+        } else {
+            folders.append(NotesFolderDefinition(path: normalizedPath, color: newFolderColor))
+        }
+        settings.notesFolders = folders
+        cancelCreateFolder()
+        requestMeetingFamilyFolderChange(
+            controller: controller,
+            selection: selection,
+            folderPath: normalizedPath,
+            historyCount: historyCount
+        )
+    }
+
+    private func cancelCreateFolder() {
+        creatingFolderForSessionID = nil
+        creatingFolderForMeetingFamilyKey = nil
+        newFolderFieldFocused = false
+        newFolderPath = ""
+        newFolderColor = .orange
+    }
+
+    private func sessionTitle(for session: SessionIndex) -> String {
+        let title = session.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (title?.isEmpty == false ? title : nil) ?? "Untitled"
+    }
+
+    @ViewBuilder
+    private func folderSectionHeader(_ group: SessionFolderGroup) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(folderColor(for: group.id))
+            Text(group.title)
+        }
+    }
+
+    @ViewBuilder
+    private func rootFolderSectionHeader() -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("My notes")
+        }
+    }
+
+    private func renamePlaceholder(for sessionID: String, controller: NotesController) -> String {
+        let title = controller.state.sessionHistory
+            .first(where: { $0.id == sessionID })?
+            .title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (title?.isEmpty == false ? title : nil) ?? "Untitled"
     }
 
     // MARK: - Tag Filter Bar
@@ -295,7 +781,7 @@ struct NotesView: View {
         var seen = Set<String>()
         var result: [String] = []
         for session in sessions {
-            for tag in session.tags ?? [] {
+            for tag in NotesController.visibleTags(for: session) {
                 let key = tag.lowercased()
                 if !seen.contains(key) {
                     seen.insert(key)
@@ -304,6 +790,107 @@ struct NotesView: View {
             }
         }
         return result.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func folderDefinition(for folderPath: String?) -> NotesFolderDefinition? {
+        guard let folderPath else { return nil }
+        return settings.notesFolders.first {
+            $0.path.localizedCaseInsensitiveCompare(folderPath) == .orderedSame
+        }
+    }
+
+    private func folderColor(for folderPath: String?) -> Color {
+        folderColor(for: folderDefinition(for: folderPath)?.color ?? .gray)
+    }
+
+    private func folderColor(for color: NotesFolderColor) -> Color {
+        switch color {
+        case .gray:
+            return Color.secondary
+        case .orange:
+            return .orange
+        case .gold:
+            return Color(red: 0.74, green: 0.61, blue: 0.23)
+        case .purple:
+            return Color(red: 0.58, green: 0.48, blue: 0.86)
+        case .blue:
+            return .blue
+        case .teal:
+            return .teal
+        case .green:
+            return .green
+        case .red:
+            return .red
+        }
+    }
+
+    private func requestMeetingFamilyFolderChange(
+        controller: NotesController,
+        selection: MeetingFamilySelection,
+        folderPath: String?,
+        historyCount: Int
+    ) {
+        let currentFolderPath = settings.meetingFamilyPreferences(forHistoryKey: selection.key)?.folderPath
+        guard currentFolderPath != folderPath else { return }
+
+        if historyCount > 0 {
+            pendingMeetingFamilyFolderChange = PendingMeetingFamilyFolderChange(
+                historyKey: selection.key,
+                familyTitle: selection.title,
+                folderPath: folderPath,
+                existingMeetingCount: historyCount
+            )
+            return
+        }
+
+        controller.applyMeetingFamilyFolderPreference(
+            folderPath,
+            moveExistingSessions: false,
+            forHistoryKey: selection.key
+        )
+    }
+
+    private func applyPendingMeetingFamilyFolderChange(
+        controller: NotesController,
+        moveExistingSessions: Bool
+    ) {
+        guard let pendingChange = pendingMeetingFamilyFolderChange else { return }
+        controller.applyMeetingFamilyFolderPreference(
+            pendingChange.folderPath,
+            moveExistingSessions: moveExistingSessions,
+            forHistoryKey: pendingChange.historyKey
+        )
+        pendingMeetingFamilyFolderChange = nil
+    }
+
+    private func moveExistingMeetingsTitle(for pendingChange: PendingMeetingFamilyFolderChange) -> String {
+        let count = pendingChange.existingMeetingCount
+        return count == 1 ? "Move 1 saved meeting too" : "Move \(count) saved meetings too"
+    }
+
+    private func meetingFamilyFolderChangeMessage(for pendingChange: PendingMeetingFamilyFolderChange) -> String {
+        let destination = folderDisplayName(for: pendingChange.folderPath)
+        let count = pendingChange.existingMeetingCount
+        let noun = count == 1 ? "saved meeting" : "saved meetings"
+        return "Use \(destination) for future meetings in \"\(pendingChange.familyTitle)\", or move the existing \(count) \(noun) there too."
+    }
+
+    private func folderDisplayName(for folderPath: String?) -> String {
+        folderDefinition(for: folderPath)?.displayName ?? "My notes"
+    }
+
+    private func normalizedMeetingFamilyFolderPath(_ rawPath: String) -> String? {
+        guard let normalized = NotesFolderDefinition.normalizePath(rawPath) else { return nil }
+        return normalized.split(separator: "/").count <= 2 ? normalized : nil
+    }
+
+    private func meetingFamilyFolderChoices(including preferredFolderPath: String?) -> [NotesFolderDefinition] {
+        settings.notesFolders
+            .filter {
+                $0.path.split(separator: "/").count <= 2
+                    || $0.path.localizedCaseInsensitiveCompare(preferredFolderPath ?? "") == .orderedSame
+            }
+            .sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
     }
 
     // MARK: - Tag Editor Popover
@@ -409,26 +996,694 @@ struct NotesView: View {
 
     @ViewBuilder
     private func detailContent(controller: NotesController, state: NotesState) -> some View {
-        if let sessionID = state.selectedSessionID {
-            VStack(spacing: 0) {
-                detailToolbar(controller: controller, state: state)
-                Divider()
-                detailBody(controller: controller, state: state, sessionID: sessionID)
-            }
-            .background {
-                Group {
-                    Button("") { detailViewMode = .transcript }
-                        .keyboardShortcut("1", modifiers: .command)
-                    Button("") { detailViewMode = .notes }
-                        .keyboardShortcut("2", modifiers: .command)
-                }
-                .frame(width: 0, height: 0)
-                .opacity(0)
-                .accessibilityHidden(true)
-            }
+        if let selection = state.selectedMeetingFamily {
+            meetingFamilyDetail(controller: controller, state: state, selection: selection)
         } else {
             ContentUnavailableView("Select a Session", systemImage: "doc.text", description: Text("Choose a session from the sidebar to view or generate notes."))
         }
+    }
+
+    @ViewBuilder
+    private func meetingFamilyDetail(
+        controller: NotesController,
+        state: NotesState,
+        selection: MeetingFamilySelection
+    ) -> some View {
+        let focusedSessionID = state.selectedSessionID
+        let historyEntries = state.meetingHistoryEntries.filter { $0.session.id != focusedSessionID }
+        let suggestions = state.relatedMeetingSuggestions
+        let hasHistory = !historyEntries.isEmpty
+        let hasSuggestions = !suggestions.isEmpty
+        let showsTabs = hasHistory && hasSuggestions
+        let activeBottomTab: MeetingFamilyBottomTab = showsTabs
+            ? meetingFamilyBottomTab
+            : (hasHistory ? .history : .link)
+        let bottomSectionLabel = hasHistory ? "Previous meetings" : "Related meetings"
+
+        GeometryReader { proxy in
+            let totalHeight = proxy.size.height
+            let showsBottomSection = hasHistory || hasSuggestions
+            let bottomHeight = defaultMeetingFamilyBottomHeight(
+                totalHeight: totalHeight,
+                focusedSessionID: focusedSessionID
+            )
+
+            VStack(spacing: 0) {
+                if focusedSessionID != nil {
+                    focusedSessionDetail(controller: controller, state: state, selection: selection)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            meetingFamilyOverviewSection(
+                                controller: controller,
+                                state: state,
+                                selection: selection,
+                                historyCount: state.meetingHistoryEntries.count
+                            )
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(20)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                if showsBottomSection {
+                    meetingFamilyCollapseHandle(title: bottomSectionLabel)
+
+                    if !isMeetingFamilyBottomCollapsed {
+                        meetingFamilyBottomSection(
+                            controller: controller,
+                            historyEntries: historyEntries,
+                            suggestions: suggestions,
+                            activeTab: activeBottomTab,
+                            showsTabs: showsTabs,
+                            linkingSuggestionKey: state.linkingMeetingSuggestionKey
+                        )
+                        .frame(maxWidth: .infinity, minHeight: bottomHeight, maxHeight: bottomHeight)
+                    }
+                } else if focusedSessionID == nil {
+                    ContentUnavailableView(
+                        "No history yet",
+                        systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
+                        description: Text("OpenOats hasn’t saved any other meetings for this title yet.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 20)
+                }
+            }
+        }
+    }
+
+    private func defaultMeetingFamilyBottomHeight(totalHeight: CGFloat, focusedSessionID: String?) -> CGFloat {
+        let preferred = focusedSessionID != nil ? min(300, totalHeight * 0.42) : min(340, totalHeight * 0.45)
+        return max(preferred, 120)
+    }
+
+    @ViewBuilder
+    private func meetingFamilyCollapseHandle(title: String) -> some View {
+        ZStack {
+            Divider()
+
+            Button {
+                withAnimation(.snappy(duration: 0.18, extraBounce: 0)) {
+                    isMeetingFamilyBottomCollapsed.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isMeetingFamilyBottomCollapsed ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(title)
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(Color(nsColor: .windowBackgroundColor))
+                )
+                .overlay(
+                    Capsule()
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help(isMeetingFamilyBottomCollapsed ? "Show \(title.lowercased())" : "Hide \(title.lowercased())")
+        }
+        .frame(height: 18)
+        .onHover { isHovering in
+            if isHovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func meetingFamilyBottomSection(
+        controller: NotesController,
+        historyEntries: [MeetingHistoryEntry],
+        suggestions: [MeetingHistorySuggestion],
+        activeTab: MeetingFamilyBottomTab,
+        showsTabs: Bool,
+        linkingSuggestionKey: String?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showsTabs {
+                meetingFamilyBottomTabBar
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .padding(.bottom, 12)
+            }
+
+            switch activeTab {
+            case .history:
+                meetingHistorySection(
+                    controller: controller,
+                    historyEntries: historyEntries,
+                    showsHeader: !showsTabs
+                )
+            case .link:
+                relatedMeetingSuggestionsSection(
+                    controller: controller,
+                    suggestions: suggestions,
+                    showsExistingHistory: !historyEntries.isEmpty,
+                    linkingSuggestionKey: linkingSuggestionKey,
+                    showsHeader: !showsTabs
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var meetingFamilyBottomTabBar: some View {
+        HStack(spacing: 6) {
+            meetingFamilyBottomTabButton(title: "Previous meetings", tab: .history)
+            meetingFamilyBottomTabButton(title: "Link meetings", tab: .link)
+        }
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func meetingFamilyBottomTabButton(
+        title: String,
+        tab: MeetingFamilyBottomTab
+    ) -> some View {
+        let isSelected = meetingFamilyBottomTab == tab
+        Button {
+            meetingFamilyBottomTab = tab
+        } label: {
+            Text(title)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? .primary : .secondary)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 11)
+                        .fill(isSelected ? Color(nsColor: .windowBackgroundColor) : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11)
+                        .strokeBorder(
+                            isSelected ? Color.primary.opacity(0.06) : Color.clear,
+                            lineWidth: 1
+                        )
+                )
+                .shadow(
+                    color: isSelected ? Color.black.opacity(0.06) : .clear,
+                    radius: 6,
+                    x: 0,
+                    y: 1
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func meetingFamilyOverviewSection(
+        controller: NotesController,
+        state: NotesState,
+        selection: MeetingFamilySelection,
+        historyCount: Int
+    ) -> some View {
+        let preferredFolderPath = settings.meetingFamilyPreferences(forHistoryKey: selection.key)?.folderPath
+        let preferredFolder = folderDefinition(for: preferredFolderPath)
+        let folders = meetingFamilyFolderChoices(including: preferredFolderPath)
+
+        if let event = selection.upcomingEvent {
+            let prepNotes = Binding(
+                get: { settings.meetingPrepNotes(for: event) },
+                set: { settings.setMeetingPrepNotes($0, for: event) }
+            )
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(event.title)
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(.primary)
+
+                        HStack(spacing: 12) {
+                            Text(CalendarEventDisplay.timeRange(for: event))
+                            if let calendarTitle = event.calendarTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               !calendarTitle.isEmpty {
+                                Text(calendarTitle)
+                            }
+                            meetingFamilyFolderMenu(
+                                controller: controller,
+                                selection: selection,
+                                historyCount: historyCount,
+                                preferredFolderPath: preferredFolderPath,
+                                preferredFolder: preferredFolder,
+                                folders: folders
+                            )
+                            meetingFamilyKnowledgeBaseSignal(state: state)
+                        }
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    HStack(spacing: 8) {
+                        if event.meetingURL != nil {
+                            Button {
+                                joinMeeting(for: event)
+                            } label: {
+                                Label("Join", systemImage: "video.fill")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Button {
+                            startRecording(for: event, selectedTemplate: state.selectedTemplate)
+                        } label: {
+                            Label("Start recording", systemImage: "mic.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(coordinator.isRecording)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 0) {
+                    TextEditor(text: prepNotes)
+                        .font(.system(size: 12))
+                        .scrollContentBackground(.hidden)
+                        .frame(minHeight: 96)
+                        .padding(6)
+                        .background(Color(nsColor: .textBackgroundColor).opacity(0.65))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(alignment: .topLeading) {
+                            if prepNotes.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("Add prep notes…")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.leading, 11)
+                                    .padding(.top, 10)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                }
+            }
+            .padding(18)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(.quaternary, lineWidth: 1)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(selection.title)
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                HStack(spacing: 12) {
+                    Text("Meeting history")
+                    Text("\(historyCount) saved meeting\(historyCount == 1 ? "" : "s")")
+                    if let calendarTitle = selection.calendarTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !calendarTitle.isEmpty {
+                        Text(calendarTitle)
+                    }
+                    meetingFamilyFolderMenu(
+                        controller: controller,
+                        selection: selection,
+                        historyCount: historyCount,
+                        preferredFolderPath: preferredFolderPath,
+                        preferredFolder: preferredFolder,
+                        folders: folders
+                    )
+                    meetingFamilyKnowledgeBaseSignal(state: state)
+                }
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+            }
+            .padding(18)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(.quaternary, lineWidth: 1)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func meetingFamilyFolderMenu(
+        controller: NotesController,
+        selection: MeetingFamilySelection,
+        historyCount: Int,
+        preferredFolderPath: String?,
+        preferredFolder: NotesFolderDefinition?,
+        folders: [NotesFolderDefinition]
+    ) -> some View {
+        Menu {
+            Button {
+                requestMeetingFamilyFolderChange(
+                    controller: controller,
+                    selection: selection,
+                    folderPath: nil,
+                    historyCount: historyCount
+                )
+            } label: {
+                HStack {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                    Text("My notes")
+                    if preferredFolderPath == nil {
+                        Spacer()
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+
+            if !folders.isEmpty {
+                Divider()
+                ForEach(folders) { folder in
+                    Button {
+                        requestMeetingFamilyFolderChange(
+                            controller: controller,
+                            selection: selection,
+                            folderPath: folder.path,
+                            historyCount: historyCount
+                        )
+                    } label: {
+                        HStack {
+                            Image(systemName: "folder.fill")
+                                .foregroundStyle(folderColor(for: folder.color))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(folder.displayName)
+                                if let breadcrumb = folder.breadcrumb {
+                                    Text(breadcrumb)
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if preferredFolderPath == folder.path {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button {
+                beginCreateFolder(for: selection)
+            } label: {
+                HStack {
+                    Image(systemName: "folder.badge.plus")
+                    Text("New Folder…")
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: preferredFolderPath == nil ? "folder" : "folder.fill")
+                    .foregroundStyle(folderColor(for: preferredFolder?.color ?? .gray))
+                Text(folderDisplayName(for: preferredFolderPath))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.55))
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help("Default folder for meetings like this")
+    }
+
+    @ViewBuilder
+    private func meetingFamilyKnowledgeBaseSignal(state: NotesState) -> some View {
+        if state.isMeetingFamilyKnowledgeBaseLoading {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Searching KB")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.4))
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+            .fixedSize()
+            .help("Looking for relevant knowledge base documents for this meeting family")
+        } else if let coverage = state.meetingFamilyKnowledgeBaseCoverage {
+            HStack(spacing: 6) {
+                Image(systemName: "books.vertical.fill")
+                    .foregroundStyle(.secondary)
+                Text(coverage.badgeText)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.4))
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+            .fixedSize()
+            .help(coverage.helpText)
+        }
+    }
+
+    @ViewBuilder
+    private func focusedSessionDetail(controller: NotesController, state: NotesState, selection: MeetingFamilySelection) -> some View {
+        VStack(spacing: 0) {
+            detailToolbar(controller: controller, state: state)
+            Divider()
+            meetingFamilyHeaderStrip(state: state, selection: selection, controller: controller)
+            Divider()
+            if let calendarEvent = state.loadedCalendarEvent {
+                notesCalendarContextStrip(calendarEvent)
+                Divider()
+            }
+            if let sessionID = state.selectedSessionID {
+                detailBody(controller: controller, state: state, sessionID: sessionID)
+            }
+        }
+        .background {
+            Group {
+                Button("") { detailViewMode = .transcript }
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("") { detailViewMode = .notes }
+                    .keyboardShortcut("2", modifiers: .command)
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    @ViewBuilder
+    private func meetingFamilyHeaderStrip(
+        state: NotesState,
+        selection: MeetingFamilySelection,
+        controller: NotesController
+    ) -> some View {
+        let hasCalendarContext = state.loadedCalendarEvent != nil
+
+        HStack(alignment: .center, spacing: 10) {
+            Button {
+                controller.showCurrentMeetingFamilyOverview()
+                detailViewMode = .notes
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .contentShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.borderless)
+            .help("Back")
+
+            if hasCalendarContext {
+                Text("Meeting history")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(selection.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    HStack(spacing: 8) {
+                        if let sessionID = state.selectedSessionID,
+                           let session = state.sessionHistory.first(where: { $0.id == sessionID }) {
+                            Text(session.startedAt, format: .dateTime.day().month(.abbreviated).year().hour().minute())
+                        }
+
+                        if let calendarTitle = selection.calendarTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !calendarTitle.isEmpty {
+                            Text(calendarTitle)
+                        }
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            meetingFamilyKnowledgeBaseSignal(state: state)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    @ViewBuilder
+    private func meetingHistorySection(
+        controller: NotesController,
+        historyEntries: [MeetingHistoryEntry],
+        showsHeader: Bool = true
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if showsHeader {
+                Text("Previous meetings")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(historyEntries) { entry in
+                        Button {
+                            openSessionFromMeetingHistory(entry.session, controller: controller)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(entry.session.startedAt, format: .dateTime.day().month(.abbreviated).year().hour().minute())
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(.primary)
+
+                                    Spacer(minLength: 0)
+
+                                    if entry.session.hasNotes {
+                                        Image(systemName: "doc.text.fill")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    if entry.session.folderPath != nil {
+                                        Image(systemName: "folder.fill")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(folderColor(for: entry.session.folderPath))
+                                    }
+
+                                    if entry.hasAudio {
+                                        Image(systemName: "waveform")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                            .help("Audio recording available")
+                                    }
+                                }
+
+                                HStack(spacing: 8) {
+                                    if entry.session.utteranceCount > 0 {
+                                        Text("\(entry.session.utteranceCount) utterances")
+                                    } else {
+                                        Text("No transcript")
+                                    }
+
+                                    if let source = entry.session.source?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       !source.isEmpty {
+                                        Text("•")
+                                        Text(source.capitalized)
+                                    }
+                                }
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+
+                                if let preview = entry.notesPreview {
+                                    Text(preview)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(Color(nsColor: .controlBackgroundColor))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .strokeBorder(.quaternary, lineWidth: 1)
+                            )
+                            .contentShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open this meeting")
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+    }
+
+    private func openSessionFromMeetingHistory(_ session: SessionIndex, controller: NotesController) {
+        controller.selectSession(session.id)
+        detailViewMode = session.hasNotes ? .notes : .transcript
+    }
+
+    private func startRecording(for event: CalendarEvent, selectedTemplate: MeetingTemplate?) {
+        coordinator.selectedTemplate = selectedTemplate
+        let prepNotes = settings.meetingPrepNotes(for: event)
+        coordinator.queueExternalCommand(
+            .startSession(
+                calendarEvent: event,
+                scratchpadSeed: prepNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : prepNotes
+            )
+        )
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: OpenOatsRootApp.mainWindowID)
+    }
+
+    private func joinMeeting(for event: CalendarEvent) {
+        guard let url = event.meetingURL else { return }
+        _ = NSWorkspace.shared.open(url)
     }
 
     private enum CleanupState {
@@ -467,7 +1722,7 @@ struct NotesView: View {
                 notesToolbarActions(controller: controller, state: state)
             }
 
-            if state.audioFileURL != nil {
+            if !state.availableAudioSources.isEmpty {
                 audioPlaybackButton(controller: controller, state: state)
             }
 
@@ -487,15 +1742,121 @@ struct NotesView: View {
     }
 
     @ViewBuilder
+    private func notesCalendarContextStrip(_ event: CalendarEvent) -> some View {
+        let participants = notesContextParticipants(for: event)
+
+        VStack(alignment: .leading, spacing: 8) {
+            CalendarEventSummaryRow(
+                event: event,
+                badge: nil,
+                iconName: event.isOnlineMeeting ? "video.fill" : "calendar.badge.checkmark"
+            )
+
+            if let organizer = event.organizer?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !organizer.isEmpty {
+                Label(organizer, systemImage: "person.crop.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            if !participants.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "person.2")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16, alignment: .center)
+
+                    Text(participantsLabel(for: participants))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                .help(participants.joined(separator: "\n"))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    private func notesContextParticipants(for event: CalendarEvent) -> [String] {
+        let organizerKey = normalizedParticipantKey(event.organizer)
+
+        var named: [String] = []
+        var seenNamed: Set<String> = []
+        var emails: [String] = []
+        var seenEmails: Set<String> = []
+
+        for participant in event.participants {
+            let name = participant.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name, !name.isEmpty {
+                let key = normalizedParticipantKey(name)
+                if key != organizerKey, seenNamed.insert(key).inserted {
+                    named.append(name)
+                }
+                continue
+            }
+
+            let email = participant.email?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let email, !email.isEmpty {
+                let key = email.lowercased()
+                if seenEmails.insert(key).inserted {
+                    emails.append(email)
+                }
+            }
+        }
+
+        return !named.isEmpty ? named : emails
+    }
+
+    private func normalizedParticipantKey(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
+    private func participantsLabel(for participants: [String]) -> String {
+        if participants.allSatisfy({ $0.contains("@") }) {
+            if participants.count == 1 {
+                return "Invited participant: 1 guest"
+            }
+            return "Invited participants: \(participants.count) guests"
+        }
+
+        switch participants.count {
+        case 0:
+            return ""
+        case 1:
+            return "Invited participant: \(participants[0])"
+        case 2:
+            return "Invited participants: \(participants[0]), \(participants[1])"
+        case 3:
+            return "Invited participants: \(participants[0]), \(participants[1]), \(participants[2])"
+        default:
+            return "Invited participants: \(participants[0]), \(participants[1]), +\(participants.count - 2) more"
+        }
+    }
+
+    @ViewBuilder
     private func audioPlaybackButton(controller: NotesController, state: NotesState) -> some View {
+        let sources = state.availableAudioSources
+        let selectedURL = state.audioFileURL ?? sources.first?.url
+
         Menu {
-            Button {
-                controller.toggleAudioPlayback()
-            } label: {
-                Label(
-                    state.isPlayingAudio ? "Pause" : "Play Recording",
-                    systemImage: state.isPlayingAudio ? "pause.fill" : "play.fill"
-                )
+            ForEach(sources) { source in
+                let isSelectedSource = selectedURL == source.url
+                let actionTitle = state.isPlayingAudio && isSelectedSource
+                    ? "Pause \(source.displayName)"
+                    : "Play \(source.displayName)"
+
+                Button {
+                    controller.toggleAudioPlayback(source: source)
+                } label: {
+                    Label(
+                        actionTitle,
+                        systemImage: state.isPlayingAudio && isSelectedSource ? "pause.fill" : "play.fill"
+                    )
+                }
             }
             Divider()
             Button {
@@ -529,7 +1890,7 @@ struct NotesView: View {
                 Label("Clean Up", systemImage: "sparkles")
                     .font(.system(size: 12))
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(OpenOatsProminentButtonStyle())
             .disabled(state.loadedTranscript.isEmpty)
             .help("Remove filler words and fix punctuation")
 
@@ -555,7 +1916,7 @@ struct NotesView: View {
                 Label("Clean Up", systemImage: "sparkles")
                     .font(.system(size: 12))
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(OpenOatsProminentButtonStyle())
             .help("Clean up remaining utterances")
 
             showOriginalButton(controller: controller, state: state)
@@ -580,7 +1941,23 @@ struct NotesView: View {
 
     @ViewBuilder
     private func notesToolbarActions(controller: NotesController, state: NotesState) -> some View {
-        if let notes = state.loadedNotes {
+        if controller.isManualNotesSession {
+            if state.isEditingManualNotes {
+                imageInsertMenu(controller: controller, state: state)
+            } else if state.loadedNotes != nil {
+                Button {
+                    controller.startManualNotesEditing()
+                } label: {
+                    Label("Edit Notes", systemImage: "square.and.pencil")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                imageInsertMenu(controller: controller, state: state)
+                if settings.appleNotesEnabled {
+                    appleNotesSyncButton(controller: controller, state: state)
+                }
+            }
+        } else if let notes = state.loadedNotes {
             Menu {
                 ForEach(controller.availableTemplates) { template in
                     Button {
@@ -603,12 +1980,12 @@ struct NotesView: View {
             .help(controller.isAnyGenerationInProgress
                 ? "Generating notes for \"\(controller.generatingSessionName)\"..."
                 : "Click to regenerate, or pick a different template")
-        }
-
-        imageInsertMenu(controller: controller, state: state)
-
-        if settings.appleNotesEnabled, state.loadedNotes != nil {
-            appleNotesSyncButton(controller: controller, state: state)
+            imageInsertMenu(controller: controller, state: state)
+            if settings.appleNotesEnabled, state.loadedNotes != nil {
+                appleNotesSyncButton(controller: controller, state: state)
+            }
+        } else {
+            imageInsertMenu(controller: controller, state: state)
         }
     }
 
@@ -638,8 +2015,7 @@ struct NotesView: View {
         } label: {
             switch appleNotesSyncState {
             case .idle:
-                let label = appleNotesLastSyncDate != nil ? "Re-sync to Apple Notes" : "Sync to Apple Notes"
-                Label(label, systemImage: "note.text")
+                Label(appleNotesLastSyncDate != nil ? "Re-sync" : "Apple Notes", systemImage: "note.text")
                     .font(.system(size: 12))
             case .syncing:
                 Label("Syncing…", systemImage: "arrow.triangle.2.circlepath")
@@ -657,12 +2033,6 @@ struct NotesView: View {
         .disabled(appleNotesSyncState == .syncing)
         .help(appleNotesLastSyncDate.map { "Last synced \($0.formatted(.relative(presentation: .named))). Syncing again will overwrite the note." }
               ?? "Export current notes to Apple Notes")
-
-        if appleNotesSyncState == .idle, let lastSync = appleNotesLastSyncDate {
-            Text("Synced \(lastSync.formatted(.relative(presentation: .named)))")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-        }
     }
 
     @ViewBuilder
@@ -760,10 +2130,191 @@ struct NotesView: View {
         case .generating:
             generatingView(controller: controller, state: state)
         case .idle, .completed, .error:
-            if let notes = state.loadedNotes {
+            if state.loadedTranscript.isEmpty {
+                if state.isEditingManualNotes {
+                    notesNoTranscriptState(controller: controller, state: state)
+                } else if let notes = state.loadedNotes {
+                    notesContentView(notes, sessionDirectory: state.selectedSessionDirectory)
+                } else {
+                    notesNoTranscriptState(controller: controller, state: state)
+                }
+            } else if let notes = state.loadedNotes {
                 notesContentView(notes, sessionDirectory: state.selectedSessionDirectory)
             } else {
                 notesEmptyState(controller: controller, state: state, sessionID: sessionID)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func notesNoTranscriptState(controller: NotesController, state: NotesState) -> some View {
+        let isEmbeddedMeetingFamilyDetail = state.selectedMeetingFamily != nil
+
+        if state.isEditingManualNotes {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text("No transcript was recorded for this session. You can still save manual notes.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button {
+                            controller.saveManualNotes()
+                        } label: {
+                            Label("Save Notes", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(OpenOatsProminentButtonStyle())
+                        .disabled(!controller.hasUnsavedManualNotesChanges)
+
+                        Button {
+                            controller.discardManualNotesDraft()
+                        } label: {
+                            Label("Revert", systemImage: "arrow.uturn.backward")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!controller.hasUnsavedManualNotesChanges)
+                    }
+                    .controlSize(.small)
+
+                    TextEditor(text: Binding(
+                        get: { state.manualNotesDraft },
+                        set: { controller.updateManualNotesDraft($0) }
+                    ))
+                    .font(.system(size: 13))
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: isEmbeddedMeetingFamilyDetail ? 220 : 320)
+                    .padding(10)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.85))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(.quaternary, lineWidth: 1)
+                    )
+                    .accessibilityIdentifier("notes.manualEditor")
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 24)
+            }
+        } else if isEmbeddedMeetingFamilyDetail {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("No transcript")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("There are no recorded utterances to turn into notes for this session.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        controller.startManualNotesEditing()
+                    } label: {
+                        Label("Start writing notes", systemImage: "square.and.pencil")
+                    }
+                    .buttonStyle(OpenOatsProminentButtonStyle())
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 24)
+            }
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("No transcript")
+                        .font(.system(size: 28, weight: .semibold))
+                    Text("There are no recorded utterances to turn into notes for this session.")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        controller.startManualNotesEditing()
+                    } label: {
+                        Label("Start writing notes", systemImage: "square.and.pencil")
+                    }
+                    .buttonStyle(OpenOatsProminentButtonStyle())
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(32)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func relatedMeetingSuggestionsSection(
+        controller: NotesController,
+        suggestions: [MeetingHistorySuggestion],
+        showsExistingHistory: Bool,
+        linkingSuggestionKey: String?,
+        showsHeader: Bool = true
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if showsHeader {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(showsExistingHistory ? "Link more meetings" : "Possible related meetings")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text(
+                        showsExistingHistory
+                            ? "Bring other renamed titles into this meeting series."
+                            : "Link an older title into this meeting series."
+                    )
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(suggestions) { suggestion in
+                        let isLinking = linkingSuggestionKey == suggestion.key
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(suggestion.title)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.primary)
+
+                                HStack(spacing: 8) {
+                                    Text("\(suggestion.sessionCount) past meeting\(suggestion.sessionCount == 1 ? "" : "s")")
+                                    if suggestion.notesCount > 0 {
+                                        Text("•")
+                                        Text("\(suggestion.notesCount) with notes")
+                                    }
+                                }
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                            }
+
+                            Spacer(minLength: 0)
+
+                            Button {
+                                controller.linkMeetingHistorySuggestion(suggestion)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if isLinking {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    }
+                                    Text(isLinking ? "Linking…" : "Link")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isLinking)
+                        }
+                        .padding(14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(nsColor: .controlBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(.quaternary, lineWidth: 1)
+                        )
+                    }
+                }
             }
         }
     }
@@ -801,36 +2352,136 @@ struct NotesView: View {
     }
 
     private func notesEmptyState(controller: NotesController, state: NotesState, sessionID: String) -> some View {
-        ContentUnavailableView {
-            Label("Generate Notes", systemImage: "sparkles")
-        } description: {
-            Text("Summarize this transcript into structured meeting notes.")
-        } actions: {
-            if case .error(let error) = state.notesGenerationStatus {
-                Text(error)
-                    .foregroundStyle(.red)
-                    .font(.system(size: 12))
-            }
+        let isEmbeddedMeetingFamilyDetail = state.selectedMeetingFamily != nil
 
-            VStack(spacing: 8) {
-                Button {
-                    controller.generateNotes(sessionID: sessionID, settings: settings)
-                } label: {
-                    Label("Generate Notes", systemImage: "sparkles")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(state.loadedTranscript.isEmpty || controller.isAnyGenerationInProgress)
-                .accessibilityIdentifier("notes.generateButton")
+        return ScrollView {
+            VStack(spacing: isEmbeddedMeetingFamilyDetail ? 16 : 18) {
+                if isEmbeddedMeetingFamilyDetail {
+                    HStack(spacing: 10) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 16, weight: .light))
+                            .foregroundStyle(.tertiary)
 
-                if controller.isAnyGenerationInProgress {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.mini)
-                        Text("Generating notes for \"\(controller.generatingSessionName)\"...")
-                            .font(.system(size: 12))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Generate Notes")
+                                .font(.system(size: 18, weight: .semibold))
+                            Text("Summarize this transcript into structured meeting notes.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: 300, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Spacer(minLength: 72)
+
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 26, weight: .light))
+                        .foregroundStyle(.tertiary)
+
+                    VStack(spacing: 6) {
+                        Text("Generate Notes")
+                            .font(.system(size: 22, weight: .semibold))
+                        Text("Summarize this transcript into structured meeting notes.")
+                            .font(.system(size: 13))
                             .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
                 }
+
+                if case .error(let error) = state.notesGenerationStatus {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(error)
+                            .font(.system(size: 12))
+                    }
+                    .frame(maxWidth: isEmbeddedMeetingFamilyDetail ? 300 : .infinity, alignment: .leading)
+                    .foregroundStyle(.red)
+                }
+
+                VStack(spacing: 10) {
+                    if let selectedTemplate = state.selectedTemplate {
+                        HStack(spacing: 10) {
+                            Text("Template")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Menu {
+                                ForEach(controller.availableTemplates) { template in
+                                    Button {
+                                        controller.selectTemplate(template)
+                                    } label: {
+                                        Label(template.name, systemImage: template.icon)
+                                    }
+                                    .disabled(selectedTemplate.id == template.id)
+                                }
+                            } label: {
+                                Label(selectedTemplate.name, systemImage: selectedTemplate.icon)
+                                    .font(.system(size: 12))
+                            }
+                            .menuStyle(.button)
+                            .buttonStyle(.bordered)
+                            .fixedSize()
+                            .help("Choose the note template for the first generation")
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color(nsColor: .controlBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(.quaternary, lineWidth: 1)
+                        )
+
+                        if let selection = state.selectedMeetingFamily {
+                            Toggle(isOn: Binding(
+                                get: {
+                                    guard let selectedTemplate = state.selectedTemplate else { return false }
+                                    return settings.meetingFamilyPreferences(forHistoryKey: selection.key)?.templateID == selectedTemplate.id
+                                },
+                                set: { controller.setSelectedTemplateSavedForMeetingFamily($0) }
+                            )) {
+                                Text("Use as default for meetings like this")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 11))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+
+                    Button {
+                        controller.generateNotes(sessionID: sessionID, settings: settings)
+                    } label: {
+                        Label("Generate Notes", systemImage: "sparkles")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(OpenOatsProminentButtonStyle())
+                    .disabled(state.loadedTranscript.isEmpty || controller.isAnyGenerationInProgress)
+                    .accessibilityIdentifier("notes.generateButton")
+
+                    if controller.isAnyGenerationInProgress {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("Generating notes for \"\(controller.generatingSessionName)\"...")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(maxWidth: 300)
+
+                if !isEmbeddedMeetingFamilyDetail {
+                    Spacer()
+                }
             }
+            .frame(maxWidth: .infinity, alignment: isEmbeddedMeetingFamilyDetail ? .topLeading : .center)
+            .padding(.horizontal, 24)
+            .padding(.vertical, isEmbeddedMeetingFamilyDetail ? 24 : 0)
         }
     }
 
@@ -910,6 +2561,9 @@ struct NotesView: View {
         case .transcript:
             return state.loadedTranscript.isEmpty
         case .notes:
+            if state.loadedTranscript.isEmpty {
+                return state.manualNotesDraft.isEmpty
+            }
             return state.loadedNotes == nil
         }
     }
@@ -1061,7 +2715,7 @@ struct NotesView: View {
                 return "[\(Self.transcriptTimeFormatter.string(from: record.timestamp))] \(label): \(content)"
             }.joined(separator: "\n")
         case .notes:
-            text = state.loadedNotes?.markdown ?? ""
+            text = state.loadedTranscript.isEmpty ? state.manualNotesDraft : (state.loadedNotes?.markdown ?? "")
         }
 
         NSPasteboard.general.clearContents()

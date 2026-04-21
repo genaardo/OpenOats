@@ -7,8 +7,6 @@ struct ContentView: View {
         case confirmDownload
     }
 
-    private let compactHeaderVerticalPadding: CGFloat = 10
-
     @Bindable var settings: AppSettings
     @Environment(AppContainer.self) private var container
     @Environment(AppCoordinator.self) private var coordinator
@@ -21,7 +19,6 @@ struct ContentView: View {
     @State private var showOnboarding = false
     @State private var showConsentSheet = false
     @State private var pendingControlBarAction: ControlBarAction?
-    @State private var windowChromeTopInset: CGFloat = 0
 
     var body: some View {
         bodyWithModifiers
@@ -37,14 +34,6 @@ struct ContentView: View {
                     .font(.system(size: 13, weight: .semibold))
 
                 Spacer()
-
-                // KB indexing status (subtle, read-only)
-                if !controllerState.kbIndexingProgress.isEmpty {
-                    Text(controllerState.kbIndexingProgress)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
 
                 Button {
                     openWindow(id: "notes")
@@ -75,7 +64,7 @@ struct ContentView: View {
                 .accessibilityIdentifier("app.settingsButton")
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, compactHeaderVerticalPadding)
+            .padding(.vertical, 10)
 
             Divider()
 
@@ -104,7 +93,7 @@ struct ContentView: View {
                             Label("Generate Notes", systemImage: "sparkles")
                                 .font(.system(size: 12))
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(OpenOatsProminentButtonStyle())
                         .controlSize(.small)
                         .accessibilityIdentifier("app.generateNotesButton")
                     }
@@ -116,53 +105,8 @@ struct ContentView: View {
                 Divider()
             }
 
-            // Batch transcription / import progress banner
-            if case .transcribing(let progress) = controllerState.batchStatus {
-                HStack(spacing: 8) {
-                    ProgressView(value: progress, total: 1.0)
-                        .progressViewStyle(.linear)
-                        .frame(maxWidth: .infinity)
-                    Text(controllerState.batchIsImporting
-                         ? "Importing meeting recording… \(Int(progress * 100))%"
-                         : "Re-transcribing... \(Int(progress * 100))%")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial)
-
-                Divider()
-            } else if case .loading = controllerState.batchStatus {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(controllerState.batchIsImporting
-                         ? "Preparing to import…"
-                         : "Loading batch model...")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial)
-
-                Divider()
-            } else if case .completed = controllerState.batchStatus {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .font(.system(size: 12))
-                    Text(controllerState.batchIsImporting
-                         ? "Meeting recording imported"
-                         : "Re-transcription complete")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial)
+            if controllerState.isRunning, let event = controllerState.matchedCalendarEvent {
+                MatchedCalendarEventBanner(event: event)
 
                 Divider()
             }
@@ -192,56 +136,55 @@ struct ContentView: View {
                 Divider()
             }
 
-            Spacer(minLength: 0)
+            if controllerState.isRunning {
+                Spacer(minLength: 0)
 
-            // Collapsible transcript (hidden when live transcript is disabled)
-            if controllerState.showLiveTranscript {
-                DisclosureGroup(isExpanded: $isTranscriptExpanded) {
-                    IsolatedTranscriptWrapper(state: controllerState)
-                        .frame(height: 150)
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("Transcript")
-                            .font(.system(size: 12, weight: .medium))
-                        if !controllerState.liveTranscript.isEmpty {
-                            Text("(\(controllerState.liveTranscript.count))")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                        if isTranscriptExpanded && !controllerState.liveTranscript.isEmpty {
-                            Button {
-                                openWindow(id: "transcript")
-                            } label: {
-                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                // Collapsible transcript (hidden when live transcript is disabled)
+                if controllerState.showLiveTranscript {
+                    DisclosureGroup(isExpanded: $isTranscriptExpanded) {
+                        IsolatedTranscriptWrapper(state: controllerState)
+                            .frame(height: 150)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text("Transcript")
+                                .font(.system(size: 12, weight: .medium))
+                            if !controllerState.liveTranscript.isEmpty {
+                                Text("(\(controllerState.liveTranscript.count))")
                                     .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .padding(4)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                                    .foregroundStyle(.tertiary)
                             }
-                            .buttonStyle(.plain)
-                            .help("Open transcript in separate window")
+                            Spacer()
+                            if isTranscriptExpanded && !controllerState.liveTranscript.isEmpty {
+                                Button {
+                                    openWindow(id: "transcript")
+                                } label: {
+                                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                        .padding(4)
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Open transcript in separate window")
 
-                            Button {
-                                copyTranscript()
-                            } label: {
-                                Image(systemName: "doc.on.doc")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .padding(4)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                                Button {
+                                    copyTranscript()
+                                } label: {
+                                    Image(systemName: "doc.on.doc")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                        .padding(4)
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                }
+                                .buttonStyle(.plain)
+                                .help("Copy transcript")
                             }
-                            .buttonStyle(.plain)
-                            .help("Copy transcript")
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
 
-            // Collapsible scratchpad during live session
-            if controllerState.isRunning {
                 Divider()
                 ScratchpadSection(
                     text: Binding(
@@ -249,6 +192,9 @@ struct ContentView: View {
                         set: { liveSessionController?.updateScratchpad($0) }
                     )
                 )
+            } else {
+                IdleHomeDashboardView(settings: settings)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
             Divider()
@@ -267,7 +213,6 @@ struct ContentView: View {
                 }
             )
         }
-        .padding(.top, max(windowChromeTopInset - compactHeaderVerticalPadding, 0))
     }
 
     private var bodyWithModifiers: some View {
@@ -276,9 +221,6 @@ struct ContentView: View {
 
     private var sizedRootContent: some View {
         rootContent
-            .background {
-                WindowChromeTopInsetReader(topInset: $windowChromeTopInset)
-            }
             .frame(minWidth: 360, maxWidth: 600, minHeight: 400)
             .background(.ultraThinMaterial)
     }
@@ -392,6 +334,9 @@ struct ContentView: View {
         .onChange(of: settings.calendarIntegrationEnabled) {
             container.updateCalendarIntegration(enabled: settings.calendarIntegrationEnabled)
         }
+        .onChange(of: settings.suggestionsAlwaysOnTop) {
+            overlayManager.updateAlwaysOnTop(settings.suggestionsAlwaysOnTop)
+        }
         .onChange(of: settings.sidebarMode) {
             if settings.sidebarMode == .classicSuggestions {
                 coordinator.suggestionEngine?.startPreFetching()
@@ -493,30 +438,6 @@ struct ContentView: View {
     }
 }
 
-private struct WindowChromeTopInsetReader: NSViewRepresentable {
-    @Binding var topInset: CGFloat
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        updateTopInset(for: view)
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        updateTopInset(for: nsView)
-    }
-
-    private func updateTopInset(for view: NSView) {
-        let binding = _topInset
-        DispatchQueue.main.async { [weak view] in
-            guard let window = view?.window else { return }
-            let chromeHeight = max(window.frame.height - window.contentLayoutRect.height, 0)
-            guard abs(binding.wrappedValue - chromeHeight) > 0.5 else { return }
-            binding.wrappedValue = chromeHeight
-        }
-    }
-}
-
 // MARK: - Scratchpad Section
 
 private struct ScratchpadSection: View {
@@ -576,6 +497,9 @@ private struct IsolatedControlBarWrapper: View {
             isMicMuted: state.isMicMuted,
             modelDisplayName: state.modelDisplayName,
             transcriptionPrompt: state.transcriptionPrompt,
+            batchStatus: state.batchStatus,
+            batchIsImporting: state.batchIsImporting,
+            kbIndexingStatus: state.kbIndexingStatus,
             statusMessage: state.statusMessage,
             errorMessage: state.errorMessage,
             needsDownload: state.needsDownload,
