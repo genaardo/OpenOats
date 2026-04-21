@@ -32,7 +32,7 @@ struct NotesView: View {
     }
 
     enum AppleNotesSyncState {
-        case idle, syncing, success, failed
+        case idle, syncing, failed
     }
 
     enum MeetingFamilyBottomTab: String, CaseIterable {
@@ -2008,23 +2008,20 @@ struct NotesView: View {
                     records: state.loadedTranscript,
                     notesMarkdown: state.loadedNotes?.markdown
                 )
-                appleNotesSyncState = success ? .success : .failed
                 if success {
                     appleNotesLastSyncDate = Date()
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    if appleNotesSyncState == .success { appleNotesSyncState = .idle }
+                    appleNotesSyncState = .idle
+                } else {
+                    appleNotesSyncState = .failed
                 }
             }
         } label: {
             switch appleNotesSyncState {
             case .idle:
-                Label("Notes", systemImage: "square.and.arrow.up")
+                Label("Export", systemImage: "square.and.arrow.up")
                     .font(.system(size: 12))
             case .syncing:
                 Label("Exporting…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 12))
-            case .success:
-                Label("Exported", systemImage: "checkmark")
                     .font(.system(size: 12))
             case .failed:
                 Label("Export Failed", systemImage: "exclamationmark.triangle")
@@ -2032,7 +2029,7 @@ struct NotesView: View {
             }
         }
         .buttonStyle(.bordered)
-        .tint(appleNotesSyncState == .success ? .green : appleNotesSyncState == .failed ? .red : nil)
+        .tint(appleNotesSyncState == .failed ? .red : nil)
         .disabled(appleNotesSyncState == .syncing)
         .help(appleNotesLastSyncDate.map {
             "Last exported to Apple Notes \($0.formatted(.relative(presentation: .named))). Exporting again will overwrite the existing note."
