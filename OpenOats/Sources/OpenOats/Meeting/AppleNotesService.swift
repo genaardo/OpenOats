@@ -47,7 +47,7 @@ enum AppleNotesService {
         utterances: [Utterance],
         notesMarkdown: String? = nil
     ) {
-        guard settings.appleNotesEnabled, settings.appleNotesAutoExport else { return }
+        guard settings.appleNotesEnabled, settings.appleNotesAutoExport, settings.appleNotesIncludeTranscript else { return }
 
         let accountName = resolvedAccountName(settings.appleNotesAccountName)
         let folderName = resolvedFolderName(settings.appleNotesFolderName)

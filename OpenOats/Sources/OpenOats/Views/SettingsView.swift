@@ -918,14 +918,17 @@ private struct IntegrationsSettingsTab: View {
                     }
 
                     if settings.appleNotesEnabled {
-                        Toggle("Auto-export when meeting ends", isOn: $settings.appleNotesAutoExport)
-                            .font(.system(size: 12))
-                        Text("When disabled, notes are only synced when you click \"Sync to Apple Notes\" manually.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-
                         Toggle("Include transcript", isOn: $settings.appleNotesIncludeTranscript)
                             .font(.system(size: 12))
+
+                        Toggle("Auto-export transcript when meeting ends", isOn: $settings.appleNotesAutoExport)
+                            .font(.system(size: 12))
+                            .disabled(!settings.appleNotesIncludeTranscript)
+                        Text(settings.appleNotesIncludeTranscript
+                             ? "Exports the transcript to Apple Notes immediately when the meeting ends. Notes are generated later — use the Export button in the Notes view to sync them."
+                             : "Enable \"Include transcript\" to auto-export when a meeting ends.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
 
                         TextField("Account", text: $settings.appleNotesAccountName, prompt: Text("iCloud"))
                             .font(.system(size: 12))
