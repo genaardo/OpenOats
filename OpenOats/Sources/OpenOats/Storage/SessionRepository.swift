@@ -64,6 +64,7 @@ struct SessionFinalizeMetadata: Sendable {
     let templateSnapshot: TemplateSnapshot?
     let utterances: [Utterance]
     let calendarEvent: CalendarEvent?
+    let transcriptIssue: SessionTranscriptIssue?
 
     init(
         endedAt: Date,
@@ -74,7 +75,8 @@ struct SessionFinalizeMetadata: Sendable {
         engine: String?,
         templateSnapshot: TemplateSnapshot?,
         utterances: [Utterance],
-        calendarEvent: CalendarEvent? = nil
+        calendarEvent: CalendarEvent? = nil,
+        transcriptIssue: SessionTranscriptIssue? = nil
     ) {
         self.endedAt = endedAt
         self.utteranceCount = utteranceCount
@@ -85,6 +87,7 @@ struct SessionFinalizeMetadata: Sendable {
         self.templateSnapshot = templateSnapshot
         self.utterances = utterances
         self.calendarEvent = calendarEvent
+        self.transcriptIssue = transcriptIssue
     }
 }
 
@@ -147,6 +150,8 @@ struct SessionMetadata: Codable, Sendable {
     /// How the session was created (nil for live sessions, "imported" for imported audio).
     var source: String?
     var calendarEvent: CalendarEvent?
+    var transcriptIssue: SessionTranscriptIssue?
+    var transcriptRecovery: SessionTranscriptRecoveryState? = nil
 }
 
 // MARK: - SessionRepository
@@ -257,7 +262,8 @@ actor SessionRepository {
             title: config.title,
             utteranceCount: 0,
             hasNotes: false,
-            calendarEvent: config.calendarEvent
+            calendarEvent: config.calendarEvent,
+            transcriptRecovery: nil
         )
         writeSessionMetadata(metadata, sessionID: sessionID)
 
@@ -416,10 +422,15 @@ actor SessionRepository {
         // Backfill cleaned text into live transcript
         backfillCleanedText(sessionID: sessionID, from: metadata.utterances)
 
+        let existingMetadata = loadSessionMetadataFile(sessionID: sessionID)
+        let startedAt = metadata.utterances.first?.timestamp
+            ?? existingMetadata?.startedAt
+            ?? Date()
+
         // Write session.json with final metadata
         let sessionMeta = SessionMetadata(
             id: sessionID,
-            startedAt: metadata.utterances.first?.timestamp ?? Date(),
+            startedAt: startedAt,
             endedAt: metadata.endedAt,
             templateSnapshot: metadata.templateSnapshot,
             title: metadata.title,
@@ -428,7 +439,9 @@ actor SessionRepository {
             language: metadata.language,
             meetingApp: metadata.meetingApp,
             engine: metadata.engine,
-            calendarEvent: metadata.calendarEvent
+            calendarEvent: metadata.calendarEvent,
+            transcriptIssue: metadata.transcriptIssue,
+            transcriptRecovery: nil
         )
         writeSessionMetadata(sessionMeta, sessionID: sessionID)
 
@@ -478,7 +491,8 @@ actor SessionRepository {
             hasNotes: false,
             language: config.language,
             engine: config.engine,
-            source: "imported"
+            source: "imported",
+            transcriptRecovery: nil
         )
         writeSessionMetadata(metadata, sessionID: sessionID)
 
@@ -507,7 +521,8 @@ actor SessionRepository {
             hasNotes: false,
             folderPath: Self.normalizeSessionFolderPath(config.folderPath),
             source: "manual",
-            calendarEvent: config.calendarEvent
+            calendarEvent: config.calendarEvent,
+            transcriptRecovery: nil
         )
         writeSessionMetadata(metadata, sessionID: sessionID)
 
@@ -536,7 +551,8 @@ actor SessionRepository {
     func saveFinalTranscript(
         sessionID: String,
         records: [SessionRecord],
-        backupCurrentTranscript: Bool = false
+        backupCurrentTranscript: Bool = false,
+        markAsRecoveredIfIssuePresent: Bool = false
     ) {
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -568,6 +584,12 @@ actor SessionRepository {
         }
 
         if let meta = loadSessionMetadataFile(sessionID: sessionID) {
+            let transcriptRecovery: SessionTranscriptRecoveryState?
+            if markAsRecoveredIfIssuePresent, meta.transcriptIssue != nil {
+                transcriptRecovery = .recoveredAfterBatch
+            } else {
+                transcriptRecovery = nil
+            }
             let refreshedMeta = SessionMetadata(
                 id: meta.id,
                 startedAt: records.first?.timestamp ?? meta.startedAt,
@@ -582,7 +604,9 @@ actor SessionRepository {
                 tags: meta.tags,
                 folderPath: meta.folderPath,
                 source: meta.source,
-                calendarEvent: meta.calendarEvent
+                calendarEvent: meta.calendarEvent,
+                transcriptIssue: nil,
+                transcriptRecovery: transcriptRecovery
             )
             writeSessionMetadata(refreshedMeta, sessionID: sessionID)
         }
@@ -749,7 +773,9 @@ actor SessionRepository {
                         tags: meta.tags,
                         folderPath: meta.folderPath,
                         source: meta.source,
-                        meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) }
+                        meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
+                        transcriptIssue: meta.transcriptIssue,
+                        transcriptRecovery: meta.transcriptRecovery
                     ))
                     continue
                 }
@@ -788,7 +814,9 @@ actor SessionRepository {
                 tags: meta.tags,
                 folderPath: meta.folderPath,
                 source: meta.source,
-                meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) }
+                meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
+                transcriptIssue: meta.transcriptIssue,
+                transcriptRecovery: meta.transcriptRecovery
             )
 
             let transcript = loadTranscript(sessionID: id)
@@ -890,7 +918,8 @@ actor SessionRepository {
             engine: index.engine,
             tags: normalizedVisibleTags.isEmpty ? nil : normalizedVisibleTags,
             folderPath: index.folderPath,
-            source: index.source
+            source: index.source,
+            transcriptRecovery: nil
         )
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -920,7 +949,8 @@ actor SessionRepository {
             engine: index.engine,
             tags: index.tags,
             folderPath: normalizedFolderPath,
-            source: index.source
+            source: index.source,
+            transcriptRecovery: nil
         )
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -950,7 +980,8 @@ actor SessionRepository {
             tags: index.tags,
             folderPath: index.folderPath,
             source: index.source,
-            calendarEvent: calendarEvent
+            calendarEvent: calendarEvent,
+            transcriptRecovery: nil
         )
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1397,7 +1428,9 @@ actor SessionRepository {
         endedAt: Date? = nil,
         templateSnapshot: TemplateSnapshot? = nil,
         title: String? = nil,
-        notes: GeneratedNotes? = nil
+        notes: GeneratedNotes? = nil,
+        transcriptIssue: SessionTranscriptIssue? = nil,
+        transcriptRecovery: SessionTranscriptRecoveryState? = nil
     ) {
         let dir = sessionDirectory(for: id)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1412,7 +1445,9 @@ actor SessionRepository {
             utteranceCount: records.count,
             hasNotes: notes != nil,
             meetingApp: nil,
-            engine: nil
+            engine: nil,
+            transcriptIssue: transcriptIssue,
+            transcriptRecovery: transcriptRecovery
         )
         writeSessionMetadata(meta, sessionID: id)
 
@@ -1780,7 +1815,9 @@ actor SessionRepository {
             tags: meta?.tags,
             folderPath: meta?.folderPath,
             source: meta?.source,
-            meetingFamilyKey: meta?.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) }
+            meetingFamilyKey: meta?.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
+            transcriptIssue: meta?.transcriptIssue,
+            transcriptRecovery: meta?.transcriptRecovery
         )
 
         MarkdownMeetingWriter.write(

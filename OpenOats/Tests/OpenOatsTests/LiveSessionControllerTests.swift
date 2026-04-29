@@ -624,6 +624,164 @@ final class LiveSessionControllerTests: XCTestCase {
         XCTAssertNil(LiveSessionController.recordingHealthNotice(for: input))
     }
 
+    func testTranscriptIssueMarksMissingAudioForExtendedEmptySession() {
+        let input = LiveSessionController.RecordingHealthInput(
+            elapsed: 8,
+            transcriptionModel: .parakeetV3,
+            utteranceCount: 0,
+            peakAudioLevel: 0,
+            micHasCapturedFrames: false,
+            systemHasCapturedFrames: false,
+            micCaptureError: nil,
+            isMicMuted: false,
+            hasBlockingError: false
+        )
+
+        XCTAssertEqual(LiveSessionController.transcriptIssue(for: input), .noAudioDetected)
+    }
+
+    func testTranscriptIssueMarksStalledTranscriptionWhenAudioWasCaptured() {
+        let input = LiveSessionController.RecordingHealthInput(
+            elapsed: 12,
+            transcriptionModel: .elevenLabsScribe,
+            utteranceCount: 0,
+            peakAudioLevel: 0.08,
+            micHasCapturedFrames: true,
+            systemHasCapturedFrames: true,
+            micCaptureError: nil,
+            isMicMuted: false,
+            hasBlockingError: false
+        )
+
+        XCTAssertEqual(
+            LiveSessionController.transcriptIssue(for: input),
+            .transcriptionProducedNoText
+        )
+    }
+
+    func testTranscriptIssueLeavesIntentionallyEmptySessionUnmarked() {
+        let input = LiveSessionController.RecordingHealthInput(
+            elapsed: 3,
+            transcriptionModel: .parakeetV3,
+            utteranceCount: 0,
+            peakAudioLevel: 0,
+            micHasCapturedFrames: false,
+            systemHasCapturedFrames: false,
+            micCaptureError: nil,
+            isMicMuted: false,
+            hasBlockingError: false
+        )
+
+        XCTAssertNil(LiveSessionController.transcriptIssue(for: input))
+    }
+
+    func testSyncProjectedStateRefreshesLastEndedSessionWhenSameSessionChanges() {
+        let dirs = makeTempDirs()
+        let settings = makeSettings(notesDirectory: dirs.notes)
+        let (controller, coordinator) = makeController(
+            root: dirs.root,
+            notesDirectory: dirs.notes,
+            settings: settings
+        )
+
+        let failedIndex = SessionIndex(
+            id: "session-1",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: Date(timeIntervalSince1970: 200),
+            title: "Standup",
+            utteranceCount: 0,
+            hasNotes: false,
+            transcriptIssue: .transcriptionProducedNoText
+        )
+        coordinator.lastEndedSession = failedIndex
+        controller.syncProjectedState(settings: settings)
+        XCTAssertEqual(controller.state.lastEndedSession?.transcriptIssue, .transcriptionProducedNoText)
+
+        var recoveredIndex = failedIndex
+        recoveredIndex.utteranceCount = 3
+        recoveredIndex.transcriptIssue = nil
+        coordinator.lastEndedSession = recoveredIndex
+        controller.syncProjectedState(settings: settings)
+
+        XCTAssertEqual(controller.state.lastEndedSession?.utteranceCount, 3)
+        XCTAssertNil(controller.state.lastEndedSession?.transcriptIssue)
+    }
+
+    func testSyncProjectedStateRefreshesRetranscriptionAvailabilityForLastEndedSession() async throws {
+        let dirs = makeTempDirs()
+        let settings = makeSettings(notesDirectory: dirs.notes)
+        let (controller, coordinator) = makeController(
+            root: dirs.root,
+            notesDirectory: dirs.notes,
+            settings: settings
+        )
+
+        let sessionID = "session_retranscribe_available"
+        await coordinator.sessionRepository.seedSession(
+            id: sessionID,
+            records: [],
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            transcriptIssue: .transcriptionProducedNoText
+        )
+
+        let audioDir = coordinator.sessionRepository.sessionsDirectoryURL
+            .appendingPathComponent(sessionID, isDirectory: true)
+            .appendingPathComponent("audio", isDirectory: true)
+        try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+        try Data("sys".utf8).write(to: audioDir.appendingPathComponent("sys.caf"))
+
+        coordinator.lastEndedSession = await coordinator.sessionRepository.loadSession(id: sessionID).index
+        controller.syncProjectedState(settings: settings)
+        try? await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertTrue(controller.state.lastEndedSessionCanRetranscribe)
+    }
+
+    func testEmptySessionDiagnosticClassificationMarksMissingAudio() {
+        let input = LiveSessionController.RecordingHealthInput(
+            elapsed: 8,
+            transcriptionModel: .parakeetV3,
+            utteranceCount: 0,
+            peakAudioLevel: 0,
+            micHasCapturedFrames: false,
+            systemHasCapturedFrames: false,
+            micCaptureError: nil,
+            isMicMuted: false,
+            hasBlockingError: false
+        )
+
+        XCTAssertEqual(
+            LiveSessionController.emptySessionDiagnosticClassification(for: input),
+            .noAudioDetected
+        )
+    }
+
+    func testEmptySessionDiagnosticsMessageIsStructuredJSON() throws {
+        let event = LiveSessionController.EmptySessionDiagnosticsEvent(
+            event: "live_empty_session_finalized",
+            sessionID: "session-123",
+            transcriptionModel: TranscriptionModel.elevenLabsScribe.rawValue,
+            elapsedSeconds: 90,
+            utteranceCount: 0,
+            peakAudioLevel: 0.08,
+            micCapturedFrames: true,
+            systemCapturedFrames: true,
+            micCaptureError: nil,
+            classification: LiveSessionController.EmptySessionDiagnosticClassification.transcriptionProducedNoText.rawValue,
+            retainedRecoveryAudio: true,
+            recoveryBatchAttempted: true,
+            recoveryResult: "queued",
+            finalUtteranceCount: nil,
+            mergedIntoSessionID: nil,
+            failureMessage: nil
+        )
+
+        let message = LiveSessionController.emptySessionDiagnosticsMessage(for: event)
+        let data = try XCTUnwrap(message.data(using: .utf8))
+        let decoded = try JSONDecoder().decode(LiveSessionController.EmptySessionDiagnosticsEvent.self, from: data)
+
+        XCTAssertEqual(decoded, event)
+    }
     func testRunningStateChangeCallbackFires() async {
         let dirs = makeTempDirs()
         let settings = makeSettings(notesDirectory: dirs.notes)
