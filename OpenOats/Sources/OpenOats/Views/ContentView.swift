@@ -201,7 +201,7 @@ struct ContentView: View {
                     }
                 )
             } else {
-                IdleHomeDashboardView(settings: settings)
+                HomeTimelineWorkspaceView(settings: settings)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
@@ -242,8 +242,17 @@ struct ContentView: View {
     }
 
     private var sizedRootContent: some View {
-        rootContent
-            .frame(minWidth: 360, maxWidth: 600, minHeight: 400, maxHeight: .infinity, alignment: .top)
+        let isRunning = liveSessionController?.state.isRunning == true
+
+        return rootContent
+            .frame(
+                minWidth: isRunning ? 360 : 460,
+                maxWidth: isRunning ? 600 : .infinity,
+                minHeight: 400,
+                maxHeight: .infinity,
+                alignment: .topLeading
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(.ultraThinMaterial)
     }
 
